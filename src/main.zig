@@ -1,71 +1,66 @@
 const std = @import("std");
 const Io = std.Io;
 
-const ken = @import("ken");
+const usage =
+    \\Usage: ken <command> [options]
+    \\
+    \\Commands:
+    \\  init     Create a new ken database
+    \\  add      Add a publication
+    \\  note     Add or view notes
+    \\  relate   Create a relationship between publications
+    \\  list     List publications
+    \\  search   Search publications
+    \\  merge    Merge two ken databases
+    \\  skill    Generate agent skills
+    \\  help     Show this help message
+    \\
+;
 
-pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+const Command = enum {
+    init,
+    add,
+    note,
+    relate,
+    list,
+    search,
+    merge,
+    skill,
+    help,
+};
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
+pub fn main(process: std.process.Init) !void {
+    const arena = process.arena.allocator();
+    const args = try process.minimal.args.toSlice(arena);
 
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .init(.stdout(), process.io, &stdout_buf);
+    const stdout = &stdout_writer.interface;
+
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_writer: Io.File.Writer = .init(.stderr(), process.io, &stderr_buf);
+    const stderr = &stderr_writer.interface;
+
+    if (args.len < 2) {
+        try stderr.print(usage, .{});
+        try stderr.flush();
+        return;
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
-
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
-
-    try ken.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
-}
-
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
+    const cmd = std.meta.stringToEnum(Command, args[1]) orelse {
+        try stderr.print("Unknown command: {s}\n\n" ++ usage, .{args[1]});
+        try stderr.flush();
+        return;
     };
+
+    switch (cmd) {
+        .help => {
+            try stdout.print(usage, .{});
+            try stdout.flush();
+        },
+        inline else => |tag| {
+            try stderr.print("{s}: not yet implemented\n", .{@tagName(tag)});
+            try stderr.flush();
+        },
+    }
 }
