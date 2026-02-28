@@ -95,6 +95,13 @@ pub const KindEntity = enum {
             .relkind => "relationship_kinds",
         };
     }
+
+    pub fn childTableName(self: KindEntity) []const u8 {
+        return switch (self) {
+            .pubkind => "publications",
+            .relkind => "relationships",
+        };
+    }
 };
 
 pub const KindSubcommand = enum {
@@ -264,34 +271,13 @@ pub fn executeKindAction(
         },
         .list => |v| {
             var sql_buf: [256]u8 = undefined;
-            const sql = blk: {
-                if (v.pagination.limit) |lim| {
-                    if (v.pagination.offset) |off| {
-                        break :blk std.fmt.bufPrintZ(
-                            &sql_buf,
-                            "SELECT name, description FROM {s} ORDER BY name LIMIT {d} OFFSET {d};",
-                            .{ table, lim, off },
-                        ) catch unreachable;
-                    }
-                    break :blk std.fmt.bufPrintZ(
-                        &sql_buf,
-                        "SELECT name, description FROM {s} ORDER BY name LIMIT {d};",
-                        .{ table, lim },
-                    ) catch unreachable;
-                }
-                if (v.pagination.offset) |off| {
-                    break :blk std.fmt.bufPrintZ(
-                        &sql_buf,
-                        "SELECT name, description FROM {s} ORDER BY name LIMIT -1 OFFSET {d};",
-                        .{ table, off },
-                    ) catch unreachable;
-                }
-                break :blk std.fmt.bufPrintZ(
-                    &sql_buf,
-                    "SELECT name, description FROM {s} ORDER BY name;",
-                    .{table},
-                ) catch unreachable;
-            };
+            const lim: i64 = if (v.pagination.limit) |l| @intCast(l) else -1;
+            const off: u32 = v.pagination.offset orelse 0;
+            const sql = std.fmt.bufPrintZ(
+                &sql_buf,
+                "SELECT name, description FROM {s} ORDER BY name LIMIT {d} OFFSET {d};",
+                .{ table, lim, off },
+            ) catch unreachable;
             const rows = database.queryRows2(allocator, sql, &.{}) catch return error.SqlFailed;
             defer db.Db.freeRows2(allocator, rows);
             for (rows) |row| {
@@ -328,59 +314,55 @@ pub fn executeKindAction(
                 }
                 return error.SqlFailed;
             };
+            if (database.changes() == 0) {
+                stderr.print("Error: {s} '{s}' not found\n", .{ lbl, v.name }) catch {};
+                return error.NotFound;
+            }
             stdout.print("Removed {s} '{s}'\n", .{ lbl, v.name }) catch return error.SqlFailed;
         },
         .update => |v| {
             if (v.new_name) |new_name| {
                 // Rename requires updating child table references (no ON UPDATE CASCADE).
-                const child_table: []const u8 = switch (entity) {
-                    .pubkind => "publications",
-                    .relkind => "relationships",
-                };
                 database.exec("BEGIN;") catch return error.SqlFailed;
                 errdefer database.exec("ROLLBACK;") catch {};
 
-                // Update child references
                 var child_buf: [256]u8 = undefined;
                 const child_sql = std.fmt.bufPrintZ(
                     &child_buf,
                     "UPDATE {s} SET kind = ?1 WHERE kind = ?2;",
-                    .{child_table},
+                    .{entity.childTableName()},
                 ) catch unreachable;
                 database.execParams(child_sql, &.{ new_name, v.name }) catch return error.SqlFailed;
 
-                // Update the kind row itself
+                // Update the kind row: always SET name, optionally SET description
                 var sql_buf: [256]u8 = undefined;
-                if (v.new_description) |new_desc| {
-                    const sql = std.fmt.bufPrintZ(
+                const sql = if (v.new_description != null)
+                    std.fmt.bufPrintZ(
                         &sql_buf,
                         "UPDATE {s} SET name = ?1, description = ?2 WHERE name = ?3;",
                         .{table},
-                    ) catch unreachable;
-                    database.execParams(sql, &.{ new_name, new_desc, v.name }) catch |err| {
-                        if (err == error.ConstraintViolation) {
-                            stderr.print("Error: {s} '{s}' already exists\n", .{ lbl, new_name }) catch {};
-                            return error.AlreadyExists;
-                        }
-                        return error.SqlFailed;
-                    };
-                } else {
-                    const sql = std.fmt.bufPrintZ(
+                    ) catch unreachable
+                else
+                    std.fmt.bufPrintZ(
                         &sql_buf,
                         "UPDATE {s} SET name = ?1 WHERE name = ?2;",
                         .{table},
                     ) catch unreachable;
-                    database.execParams(sql, &.{ new_name, v.name }) catch |err| {
-                        if (err == error.ConstraintViolation) {
-                            stderr.print("Error: {s} '{s}' already exists\n", .{ lbl, new_name }) catch {};
-                            return error.AlreadyExists;
-                        }
-                        return error.SqlFailed;
-                    };
-                }
+
+                const params: []const ?[]const u8 = if (v.new_description) |new_desc|
+                    &.{ new_name, new_desc, v.name }
+                else
+                    &.{ new_name, v.name };
+
+                database.execParams(sql, params) catch |err| {
+                    if (err == error.ConstraintViolation) {
+                        stderr.print("Error: {s} '{s}' already exists\n", .{ lbl, new_name }) catch {};
+                        return error.AlreadyExists;
+                    }
+                    return error.SqlFailed;
+                };
 
                 database.exec("COMMIT;") catch return error.SqlFailed;
-                stdout.print("Updated {s} '{s}'\n", .{ lbl, v.name }) catch return error.SqlFailed;
             } else {
                 // Description-only update, no rename
                 var sql_buf: [256]u8 = undefined;
@@ -390,8 +372,8 @@ pub fn executeKindAction(
                     .{table},
                 ) catch unreachable;
                 database.execParams(sql, &.{ v.new_description.?, v.name }) catch return error.SqlFailed;
-                stdout.print("Updated {s} '{s}'\n", .{ lbl, v.name }) catch return error.SqlFailed;
             }
+            stdout.print("Updated {s} '{s}'\n", .{ lbl, v.name }) catch return error.SqlFailed;
         },
     }
 }
@@ -818,6 +800,20 @@ test "executeKindAction: remove" {
     out.end = 0;
     const result = executeKindAction(&database, testing.allocator, .pubkind, .{ .show = .{ .name = "book" } }, &out, &err_w);
     try testing.expectError(error.NotFound, result);
+}
+
+test "executeKindAction: remove nonexistent" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const result = executeKindAction(&database, testing.allocator, .pubkind, .{ .remove = .{ .name = "nonexistent" } }, &out, &err_w);
+    try testing.expectError(error.NotFound, result);
+    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "not found") != null);
 }
 
 test "executeKindAction: update description" {

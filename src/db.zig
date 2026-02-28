@@ -89,8 +89,6 @@ pub const Db = struct {
 
     /// Prepare a statement, bind text parameters (1-indexed), step, and finalize.
     /// Use for INSERT/UPDATE/DELETE with user-supplied text values.
-    /// Prepare a statement, bind text parameters (1-indexed), step, and finalize.
-    /// Use for INSERT/UPDATE/DELETE with user-supplied text values.
     /// Returns ConstraintViolation for UNIQUE/FK violations.
     pub fn execParams(self: *Db, sql: [*:0]const u8, params: []const ?[]const u8) SqliteError!void {
         const stmt = try self.prepareAndBind(sql, params);
@@ -99,13 +97,12 @@ pub const Db = struct {
         const rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_DONE) return;
         if (rc == c.SQLITE_CONSTRAINT) return error.ConstraintViolation;
-        // Also check extended error codes for constraint sub-types
-        const ext = c.sqlite3_extended_errcode(self.handle);
-        if (ext == c.SQLITE_CONSTRAINT_UNIQUE or
-            ext == c.SQLITE_CONSTRAINT_PRIMARYKEY or
-            ext == c.SQLITE_CONSTRAINT_FOREIGNKEY)
-            return error.ConstraintViolation;
         return error.StepFailed;
+    }
+
+    /// Returns the number of rows modified by the last INSERT/UPDATE/DELETE.
+    pub fn changes(self: *Db) i32 {
+        return c.sqlite3_changes(self.handle);
     }
 
     /// Query a single text column from a single row, with text parameter bindings.
