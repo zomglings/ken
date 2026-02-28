@@ -8,30 +8,33 @@ pub const SqliteError = error{
     ExecFailed,
     PrepareFailed,
     StepFailed,
-    CloseFailed,
 };
 
 pub const MigrationError = error{
     DatabaseAheadOfMigrations,
 };
 
+const meta_key_version = "schema_version";
+
 pub const Db = struct {
     handle: *c.sqlite3,
 
     /// Open a SQLite database. Pass ":memory:" for an in-memory database.
-    pub fn open(path: [*:0]const u8) (SqliteError || MigrationError)!Db {
+    pub fn open(path: [*:0]const u8) SqliteError!Db {
         var db: ?*c.sqlite3 = null;
         const rc = c.sqlite3_open(path, &db);
         if (rc != c.SQLITE_OK) {
-            if (db) |d| _ = c.sqlite3_close(d);
+            if (db) |d| _ = c.sqlite3_close_v2(d);
             return error.CantOpen;
         }
-        return .{ .handle = db.? };
+        var self = Db{ .handle = db.? };
+        try self.exec("PRAGMA foreign_keys = ON;");
+        return self;
     }
 
     /// Close the database.
     pub fn close(self: *Db) void {
-        _ = c.sqlite3_close(self.handle);
+        _ = c.sqlite3_close_v2(self.handle);
     }
 
     /// Execute one or more SQL statements. Returns error on failure.
@@ -59,16 +62,18 @@ pub const Db = struct {
     }
 
     /// Returns the current schema version, or null if _ken_meta doesn't exist.
-    pub fn getVersion(self: *Db) (SqliteError || MigrationError)!?u32 {
-        // COUNT returns 0 (not no rows) when the table is missing, so we
-        // check sqlite_master first. A non-null result means the table exists.
+    pub fn getVersion(self: *Db) SqliteError!?u32 {
         const exists = try self.queryInt(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_ken_meta' LIMIT 1;",
         );
         if (exists == null) return null;
+        return self.readVersion();
+    }
 
+    /// Read version from _ken_meta, assuming the table exists.
+    fn readVersion(self: *Db) SqliteError!?u32 {
         const val = try self.queryInt(
-            "SELECT CAST(value AS INTEGER) FROM _ken_meta WHERE key='schema_version';",
+            "SELECT CAST(value AS INTEGER) FROM _ken_meta WHERE key='" ++ meta_key_version ++ "';",
         );
         if (val) |v| return @intCast(v);
         return null;
@@ -82,13 +87,13 @@ pub const Db = struct {
             "CREATE TABLE IF NOT EXISTS _ken_meta (key TEXT PRIMARY KEY, value TEXT);",
         );
 
-        const current = try self.getVersion();
+        // Table is guaranteed to exist, skip sqlite_master check.
+        const current = try self.readVersion();
         const target: u32 = @intCast(migrations.len);
 
         if (current) |v| {
             if (v >= target) {
                 if (v > target) return error.DatabaseAheadOfMigrations;
-                // Already at target — no-op.
                 return v;
             }
         }
@@ -97,18 +102,17 @@ pub const Db = struct {
 
         for (start..target) |i| {
             try self.exec("BEGIN;");
-            self.exec(migrations[i]) catch {
-                // Attempt rollback on failure, ignore rollback errors.
-                self.exec("ROLLBACK;") catch {};
-                return error.ExecFailed;
-            };
-            // Update version inside the transaction.
+            errdefer self.exec("ROLLBACK;") catch {};
+
+            try self.exec(migrations[i]);
+
             var buf: [128]u8 = undefined;
-            const update_sql = std.fmt.bufPrintZ(&buf, "INSERT OR REPLACE INTO _ken_meta (key, value) VALUES ('schema_version', '{d}');", .{i}) catch unreachable;
-            self.exec(update_sql) catch {
-                self.exec("ROLLBACK;") catch {};
-                return error.ExecFailed;
-            };
+            const update_sql = std.fmt.bufPrintZ(
+                &buf,
+                "INSERT OR REPLACE INTO _ken_meta (key, value) VALUES ('" ++ meta_key_version ++ "', '{d}');",
+                .{i},
+            ) catch unreachable;
+            try self.exec(update_sql);
             try self.exec("COMMIT;");
         }
 
