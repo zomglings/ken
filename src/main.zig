@@ -74,10 +74,20 @@ pub fn main(process: std.process.Init) !void {
             try stdout.flush();
         },
         .version => {
+            if (hasHelpFlag(args[2..])) {
+                try stdout.print("Usage: ken version\n\nPrint ken version.\n", .{});
+                try stdout.flush();
+                return;
+            }
             try stdout.print("{d}\n", .{ken.version});
             try stdout.flush();
         },
         .init => {
+            if (hasHelpFlag(args[2..])) {
+                try stdout.print("Usage: ken init [path]\n\nCreate or upgrade a ken database.\nIf no path is given, uses the default location.\n", .{});
+                try stdout.flush();
+                return;
+            }
             const db_path = resolveDbPath(args, arena) catch {
                 try stderr.print("Error: could not determine default database path\n", .{});
                 try stderr.flush();
@@ -114,6 +124,11 @@ pub fn main(process: std.process.Init) !void {
             try stdout.flush();
         },
         .dbversion => {
+            if (hasHelpFlag(args[2..])) {
+                try stdout.print("Usage: ken dbversion [path]\n\nPrint schema version of a ken database.\nIf no path is given, uses the default location.\n", .{});
+                try stdout.flush();
+                return;
+            }
             const db_path = resolveDbPath(args, arena) catch {
                 try stderr.print("Error: could not determine default database path\n", .{});
                 try stderr.flush();
@@ -140,10 +155,22 @@ pub fn main(process: std.process.Init) !void {
         .pubkind => try handleKind(.pubkind, args, stdout, stderr),
         .relkind => try handleKind(.relkind, args, stdout, stderr),
         inline else => |tag| {
+            if (hasHelpFlag(args[2..])) {
+                try stdout.print("Usage: ken {s} [options]\n\n{s}: not yet implemented\n", .{ @tagName(tag), @tagName(tag) });
+                try stdout.flush();
+                return;
+            }
             try stderr.print("{s}: not yet implemented\n", .{@tagName(tag)});
             try stderr.flush();
         },
     }
+}
+
+fn hasHelpFlag(args: []const [:0]const u8) bool {
+    for (args) |arg| {
+        if (ken.isHelpFlag(arg)) return true;
+    }
+    return false;
 }
 
 fn resolveDbPath(args: []const [:0]const u8, allocator: std.mem.Allocator) ![:0]const u8 {
