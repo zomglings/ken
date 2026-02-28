@@ -78,13 +78,25 @@ pub fn main(process: std.process.Init) !void {
             try stdout.flush();
         },
         .init => {
-            if (args.len < 3) {
-                try stderr.print("Usage: ken init <path>\n", .{});
+            const db_path = resolveDbPath(args, arena) catch {
+                try stderr.print("Error: could not determine default database path\n", .{});
                 try stderr.flush();
                 return;
+            };
+            if (args.len < 3) {
+                if (std.fs.path.dirname(db_path)) |dir_path| {
+                    Io.Dir.createDirAbsolute(process.io, dir_path, .default_dir) catch |err| switch (err) {
+                        error.PathAlreadyExists => {},
+                        else => {
+                            try stderr.print("Error: could not create directory '{s}'\n", .{dir_path});
+                            try stderr.flush();
+                            return;
+                        },
+                    };
+                }
             }
-            var database = ken.db.Db.open(args[2]) catch {
-                try stderr.print("Error: could not open database '{s}'\n", .{args[2]});
+            var database = ken.db.Db.open(db_path) catch {
+                try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
                 return;
             };
@@ -98,23 +110,23 @@ pub fn main(process: std.process.Init) !void {
                 try stderr.flush();
                 return;
             };
-            try stdout.print("{d}\n", .{v});
+            try stdout.print("Initialized ken database at {s} (version {d})\n", .{ db_path, v });
             try stdout.flush();
         },
         .dbversion => {
-            if (args.len < 3) {
-                try stderr.print("Usage: ken dbversion <path>\n", .{});
+            const db_path = resolveDbPath(args, arena) catch {
+                try stderr.print("Error: could not determine default database path\n", .{});
                 try stderr.flush();
                 return;
-            }
-            var database = ken.db.Db.open(args[2]) catch {
-                try stderr.print("Error: could not open database '{s}'\n", .{args[2]});
+            };
+            var database = ken.db.Db.open(db_path) catch {
+                try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
                 return;
             };
             defer database.close();
             const v = database.getVersion() catch {
-                try stderr.print("Error: could not read version from '{s}'\n", .{args[2]});
+                try stderr.print("Error: could not read version from '{s}'\n", .{db_path});
                 try stderr.flush();
                 return;
             };
@@ -132,6 +144,11 @@ pub fn main(process: std.process.Init) !void {
             try stderr.flush();
         },
     }
+}
+
+fn resolveDbPath(args: []const [:0]const u8, allocator: std.mem.Allocator) ![:0]const u8 {
+    if (args.len >= 3) return args[2];
+    return ken.defaultDbPath(allocator);
 }
 
 fn handleKind(

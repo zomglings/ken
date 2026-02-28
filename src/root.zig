@@ -1,9 +1,43 @@
 //! ken: a research literature catalog.
 
 const std = @import("std");
+const builtin = @import("builtin");
 pub const db = @import("db.zig");
 
 pub const version: u32 = 0;
+pub const default_db_name = "ken.db";
+
+/// Returns the default database path, platform-appropriate:
+/// - macOS: ~/Library/Application Support/ken/ken.db
+/// - Linux: $XDG_DATA_HOME/ken/ken.db or ~/.local/share/ken/ken.db
+/// - Windows: %LOCALAPPDATA%\ken\ken.db
+/// - Other: ~/.ken/ken.db
+/// Caller owns the returned memory.
+pub fn defaultDbPath(allocator: std.mem.Allocator) ![:0]u8 {
+    const app_dir = switch (builtin.os.tag) {
+        .windows => blk: {
+            const local = std.mem.span(std.c.getenv("LOCALAPPDATA") orelse return error.HomeDirNotFound);
+            break :blk try std.fs.path.join(allocator, &.{ local, "ken" });
+        },
+        else => blk: {
+            const home = std.mem.span(std.c.getenv("HOME") orelse return error.HomeDirNotFound);
+            break :blk switch (builtin.os.tag) {
+                .macos => try std.fs.path.join(allocator, &.{ home, "Library", "Application Support", "ken" }),
+                .linux => inner: {
+                    if (std.c.getenv("XDG_DATA_HOME")) |xdg| {
+                        break :inner try std.fs.path.join(allocator, &.{ std.mem.span(xdg), "ken" });
+                    }
+                    break :inner try std.fs.path.join(allocator, &.{ home, ".local", "share", "ken" });
+                },
+                else => try std.fs.path.join(allocator, &.{ home, ".ken" }),
+            };
+        },
+    };
+    defer allocator.free(app_dir);
+    const joined = try std.fs.path.join(allocator, &.{ app_dir, default_db_name });
+    defer allocator.free(joined);
+    return try allocator.dupeZ(u8, joined);
+}
 
 /// Ken schema migrations. Index = version number.
 pub const migrations: []const [*:0]const u8 = &.{
