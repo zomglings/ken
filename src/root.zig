@@ -71,7 +71,10 @@ pub const migrations: []const [*:0]const u8 = &.{
     \\  created_at TEXT NOT NULL DEFAULT (datetime('now')),
     \\  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     \\);
-    \\INSERT INTO publication_kinds (name, description) VALUES ('note', 'A note. The key field is unused.');
+    \\INSERT INTO publication_kinds (name, description) VALUES ('note', 'A researcher''s own note or annotation. The key field is unused. The note body is stored in the notes table, linked by publication id.');
+    \\INSERT INTO publication_kinds (name, description) VALUES ('arxiv', 'A preprint on arXiv. The key is the arXiv identifier (e.g. 2301.07041 or math.AG/0601185).');
+    \\INSERT INTO publication_kinds (name, description) VALUES ('video', 'A YouTube video. The key is the YouTube video ID (the v parameter, e.g. dQw4w9WgXcQ).');
+    \\INSERT INTO publication_kinds (name, description) VALUES ('web', 'A web page or online resource. The key is the full URL.');
     ,
 };
 
@@ -249,6 +252,80 @@ pub fn executeKindAction(
     }
 }
 
+pub const addUsage =
+    \\Usage: ken add <kind> [-k/--key <key>] [--title <title>]
+    \\
+    \\Add a publication to the database.
+    \\
+    \\Arguments:
+    \\  <kind>           Publication kind (e.g. note, arxiv, video, web)
+    \\  -k, --key <key>  Key for the publication (e.g. DOI, URL, file path)
+    \\  --title <title>  Title of the publication
+    \\
+    \\Examples:
+    \\  ken add arxiv -k 2301.07041 --title "Some paper"
+    \\  ken add note --title "Quick note"
+    \\  ken add note -k /path/to/note.md --title "From file"
+    \\
+;
+
+pub const AddAction = struct {
+    kind: []const u8,
+    key: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+};
+
+/// Parse arguments for `ken add <kind> [options]`.
+/// `args` is full argv; `cmd_index` is the index of "add".
+pub fn parseAddArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!AddAction {
+    const kind_index = cmd_index + 1;
+    if (args.len <= kind_index) return error.MissingArgument;
+
+    if (isHelpFlag(args[kind_index])) return error.HelpRequested;
+
+    var result = AddAction{ .kind = args[kind_index] };
+    const rest = args[kind_index + 1 ..];
+
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const arg: []const u8 = rest[i];
+        if (isHelpFlag(arg)) return error.HelpRequested;
+        if (std.mem.eql(u8, arg, "-k") or std.mem.eql(u8, arg, "--key")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingArgument;
+            result.key = rest[i];
+        } else if (std.mem.eql(u8, arg, "--title")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingArgument;
+            result.title = rest[i];
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+
+    return result;
+}
+
+/// Generate a UUID v4 string into the provided buffer.
+/// `rand_bytes` must be 16 random bytes (caller provides randomness).
+pub fn uuidV4(buf: *[36]u8, rand_bytes: *[16]u8) void {
+    // Set version (4) and variant (RFC 4122)
+    rand_bytes[6] = (rand_bytes[6] & 0x0f) | 0x40;
+    rand_bytes[8] = (rand_bytes[8] & 0x3f) | 0x80;
+
+    const hex = "0123456789abcdef";
+    var out: usize = 0;
+    for (rand_bytes, 0..) |b, i| {
+        if (i == 4 or i == 6 or i == 8 or i == 10) {
+            buf[out] = '-';
+            out += 1;
+        }
+        buf[out] = hex[b >> 4];
+        buf[out + 1] = hex[b & 0x0f];
+        out += 2;
+    }
+}
+
 /// Format a ParseError for display.
 pub fn formatKindError(
     entity: KindEntity,
@@ -392,4 +469,90 @@ test "help: -h within list args" {
     const args = mkArgs(&.{ "ken", "pubkind", "list", "-h" });
     const result = parseKindArgs(&args, 1);
     try testing.expectError(error.HelpRequested, result);
+}
+
+// ── parseAddArgs tests ──
+
+test "add: kind only" {
+    const args = mkArgs(&.{ "ken", "add", "note" });
+    const action = try parseAddArgs(&args, 1);
+    try testing.expectEqualStrings("note", action.kind);
+    try testing.expect(action.key == null);
+    try testing.expect(action.title == null);
+}
+
+test "add: kind with key and title" {
+    const args = mkArgs(&.{ "ken", "add", "arxiv", "-k", "2301.07041", "--title", "Some paper" });
+    const action = try parseAddArgs(&args, 1);
+    try testing.expectEqualStrings("arxiv", action.kind);
+    try testing.expectEqualStrings("2301.07041", action.key.?);
+    try testing.expectEqualStrings("Some paper", action.title.?);
+}
+
+test "add: --key long form" {
+    const args = mkArgs(&.{ "ken", "add", "web", "--key", "https://example.com", "--title", "Example" });
+    const action = try parseAddArgs(&args, 1);
+    try testing.expectEqualStrings("web", action.kind);
+    try testing.expectEqualStrings("https://example.com", action.key.?);
+    try testing.expectEqualStrings("Example", action.title.?);
+}
+
+test "add: missing kind" {
+    const args = mkArgs(&.{ "ken", "add" });
+    const result = parseAddArgs(&args, 1);
+    try testing.expectError(error.MissingArgument, result);
+}
+
+test "add: help at kind position" {
+    const args = mkArgs(&.{ "ken", "add", "--help" });
+    const result = parseAddArgs(&args, 1);
+    try testing.expectError(error.HelpRequested, result);
+}
+
+test "add: help within flags" {
+    const args = mkArgs(&.{ "ken", "add", "note", "-h" });
+    const result = parseAddArgs(&args, 1);
+    try testing.expectError(error.HelpRequested, result);
+}
+
+test "add: unknown flag" {
+    const args = mkArgs(&.{ "ken", "add", "note", "--bogus" });
+    const result = parseAddArgs(&args, 1);
+    try testing.expectError(error.UnknownFlag, result);
+}
+
+test "add: missing key value" {
+    const args = mkArgs(&.{ "ken", "add", "note", "-k" });
+    const result = parseAddArgs(&args, 1);
+    try testing.expectError(error.MissingArgument, result);
+}
+
+// ── uuidV4 tests ──
+
+test "uuidV4: correct format" {
+    var buf: [36]u8 = undefined;
+    var rand_bytes = [16]u8{ 0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00 };
+    uuidV4(&buf, &rand_bytes);
+
+    // Check hyphens at correct positions
+    try testing.expectEqual(@as(u8, '-'), buf[8]);
+    try testing.expectEqual(@as(u8, '-'), buf[13]);
+    try testing.expectEqual(@as(u8, '-'), buf[18]);
+    try testing.expectEqual(@as(u8, '-'), buf[23]);
+
+    // Check version nibble (position 14 = first hex char of byte 6)
+    try testing.expectEqual(@as(u8, '4'), buf[14]);
+
+    // Check variant nibble (position 19 = first hex char of byte 8)
+    try testing.expect(buf[19] == '8' or buf[19] == '9' or buf[19] == 'a' or buf[19] == 'b');
+}
+
+test "uuidV4: different input produces different output" {
+    var buf1: [36]u8 = undefined;
+    var buf2: [36]u8 = undefined;
+    var rand1 = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+    var rand2 = [16]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00 };
+    uuidV4(&buf1, &rand1);
+    uuidV4(&buf2, &rand2);
+    try testing.expect(!std.mem.eql(u8, &buf1, &buf2));
 }

@@ -11,7 +11,6 @@ const usage =
     \\  initpath   Print default database path
     \\  dbversion  Print schema version of a ken database
     \\  add        Add a publication
-    \\  note       Add or view notes
     \\  relate     Create a relationship between publications
     \\  list       List publications
     \\  search     Search publications
@@ -29,7 +28,6 @@ const Command = enum {
     initpath,
     dbversion,
     add,
-    note,
     relate,
     list,
     search,
@@ -39,6 +37,20 @@ const Command = enum {
     relkind,
     help,
 };
+
+fn printCommandUsage(cmd: Command, stdout: anytype) !void {
+    switch (cmd) {
+        .version => try stdout.writeAll("Usage: ken version\n\nPrint ken version.\n"),
+        .init => try stdout.writeAll("Usage: ken init [path]\n\nCreate or upgrade a ken database.\nIf no path is given, uses the default location.\n"),
+        .initpath => try stdout.writeAll("Usage: ken initpath\n\nPrint the default database path for this platform.\n"),
+        .dbversion => try stdout.writeAll("Usage: ken dbversion [path]\n\nPrint schema version of a ken database.\nIf no path is given, uses the default location.\n"),
+        .add => try stdout.writeAll(ken.addUsage),
+        .pubkind => try stdout.writeAll(ken.kindUsage(.pubkind)),
+        .relkind => try stdout.writeAll(ken.kindUsage(.relkind)),
+        .help => try stdout.writeAll(usage),
+        inline else => |tag| try stdout.writeAll("Usage: ken " ++ @tagName(tag) ++ " [options]\n\n" ++ @tagName(tag) ++ ": not yet implemented\n"),
+    }
+}
 
 pub fn main(process: std.process.Init) !void {
     const arena = process.arena.allocator();
@@ -70,26 +82,23 @@ pub fn main(process: std.process.Init) !void {
         return;
     };
 
+    // Unified help flag check — applies to all commands
+    if (hasHelpFlag(args[2..])) {
+        try printCommandUsage(cmd, stdout);
+        try stdout.flush();
+        return;
+    }
+
     switch (cmd) {
         .help => {
             try stdout.print(usage, .{});
             try stdout.flush();
         },
         .version => {
-            if (hasHelpFlag(args[2..])) {
-                try stdout.print("Usage: ken version\n\nPrint ken version.\n", .{});
-                try stdout.flush();
-                return;
-            }
             try stdout.print("{d}\n", .{ken.version});
             try stdout.flush();
         },
         .initpath => {
-            if (hasHelpFlag(args[2..])) {
-                try stdout.print("Usage: ken initpath\n\nPrint the default database path for this platform.\n", .{});
-                try stdout.flush();
-                return;
-            }
             const db_path = ken.defaultDbPath(arena) catch {
                 try stderr.print("Error: could not determine default database path\n", .{});
                 try stderr.flush();
@@ -99,11 +108,6 @@ pub fn main(process: std.process.Init) !void {
             try stdout.flush();
         },
         .init => {
-            if (hasHelpFlag(args[2..])) {
-                try stdout.print("Usage: ken init [path]\n\nCreate or upgrade a ken database.\nIf no path is given, uses the default location.\n", .{});
-                try stdout.flush();
-                return;
-            }
             const db_path = resolveDbPath(args, arena) catch {
                 try stderr.print("Error: could not determine default database path\n", .{});
                 try stderr.flush();
@@ -140,11 +144,6 @@ pub fn main(process: std.process.Init) !void {
             try stdout.flush();
         },
         .dbversion => {
-            if (hasHelpFlag(args[2..])) {
-                try stdout.print("Usage: ken dbversion [path]\n\nPrint schema version of a ken database.\nIf no path is given, uses the default location.\n", .{});
-                try stdout.flush();
-                return;
-            }
             const db_path = resolveDbPath(args, arena) catch {
                 try stderr.print("Error: could not determine default database path\n", .{});
                 try stderr.flush();
@@ -168,14 +167,131 @@ pub fn main(process: std.process.Init) !void {
             }
             try stdout.flush();
         },
-        .pubkind => try handleKind(.pubkind, args, stdout, stderr),
-        .relkind => try handleKind(.relkind, args, stdout, stderr),
-        inline else => |tag| {
-            if (hasHelpFlag(args[2..])) {
-                try stdout.print("Usage: ken {s} [options]\n\n{s}: not yet implemented\n", .{ @tagName(tag), @tagName(tag) });
-                try stdout.flush();
+        .add => {
+            const action = ken.parseAddArgs(args, 1) catch |err| {
+                switch (err) {
+                    error.HelpRequested => {
+                        try stdout.print(ken.addUsage, .{});
+                        try stdout.flush();
+                        return;
+                    },
+                    error.MissingArgument => try stderr.print("Error: missing argument. Usage: ken add <kind> [-k/--key <key>] [--title <title>]\n", .{}),
+                    error.UnknownFlag => try stderr.print("Error: unknown flag. Usage: ken add <kind> [-k/--key <key>] [--title <title>]\n", .{}),
+                    else => try stderr.print("Error: invalid arguments for 'add'\n", .{}),
+                }
+                try stderr.flush();
+                return;
+            };
+
+            const db_path = ken.defaultDbPath(arena) catch {
+                try stderr.print("Error: could not determine default database path\n", .{});
+                try stderr.flush();
+                return;
+            };
+            var database = ken.db.Db.open(db_path) catch {
+                try stderr.print("Error: could not open database '{s}'\n", .{db_path});
+                try stderr.flush();
+                return;
+            };
+            defer database.close();
+
+            // Validate that the kind exists
+            const kind_desc = database.queryTextParams(
+                arena,
+                "SELECT description FROM publication_kinds WHERE name = ?1;",
+                &.{action.kind},
+            ) catch {
+                try stderr.print("Error: could not query database\n", .{});
+                try stderr.flush();
+                return;
+            };
+            if (kind_desc == null) {
+                try stderr.print("Error: unknown publication kind '{s}'\n", .{action.kind});
+                try stderr.flush();
                 return;
             }
+
+            // Generate UUID
+            var rand_bytes: [16]u8 = undefined;
+            process.io.random(&rand_bytes);
+            var uuid_buf: [36]u8 = undefined;
+            ken.uuidV4(&uuid_buf, &rand_bytes);
+            const uuid: []const u8 = &uuid_buf;
+
+            // Insert publication
+            database.execParams(
+                "INSERT INTO publications (id, key, kind, title) VALUES (?1, ?2, ?3, ?4);",
+                &.{ uuid, action.key, action.kind, action.title },
+            ) catch {
+                try stderr.print("Error: could not insert publication\n", .{});
+                try stderr.flush();
+                return;
+            };
+
+            // For notes with a file key, read file and insert into notes table
+            if (std.mem.eql(u8, action.kind, "note")) {
+                if (action.key) |key| {
+                    const file_content = blk: {
+                        const file = Io.Dir.openFile(.cwd(), process.io, key, .{}) catch break :blk null;
+                        defer file.close(process.io);
+                        const stat = file.stat(process.io) catch break :blk null;
+                        const size: usize = @intCast(stat.size);
+                        if (size == 0) break :blk null;
+                        const buf = arena.alloc(u8, size) catch break :blk null;
+                        const n = file.readPositionalAll(process.io, buf, 0) catch break :blk null;
+                        break :blk buf[0..n];
+                    };
+                    if (file_content) |content| {
+                        var note_rand: [16]u8 = undefined;
+                        process.io.random(&note_rand);
+                        var note_uuid_buf: [36]u8 = undefined;
+                        ken.uuidV4(&note_uuid_buf, &note_rand);
+                        const note_uuid: []const u8 = &note_uuid_buf;
+
+                        database.execParams(
+                            "INSERT INTO notes (id, publication, body) VALUES (?1, ?2, ?3);",
+                            &.{ note_uuid, uuid, content },
+                        ) catch {
+                            try stderr.print("Error: could not insert note body\n", .{});
+                            try stderr.flush();
+                            return;
+                        };
+                    }
+                }
+            }
+
+            try stdout.print("{s}\n", .{uuid});
+            try stdout.flush();
+        },
+        .pubkind => {
+            const action = ken.parseKindArgs(args, 1) catch |err| {
+                if (err == error.HelpRequested) {
+                    try stdout.print(ken.kindUsage(.pubkind), .{});
+                    try stdout.flush();
+                    return;
+                }
+                try ken.formatKindError(.pubkind, err, stderr);
+                try stderr.flush();
+                return;
+            };
+            try ken.executeKindAction(.pubkind, action, stdout);
+            try stdout.flush();
+        },
+        .relkind => {
+            const action = ken.parseKindArgs(args, 1) catch |err| {
+                if (err == error.HelpRequested) {
+                    try stdout.print(ken.kindUsage(.relkind), .{});
+                    try stdout.flush();
+                    return;
+                }
+                try ken.formatKindError(.relkind, err, stderr);
+                try stderr.flush();
+                return;
+            };
+            try ken.executeKindAction(.relkind, action, stdout);
+            try stdout.flush();
+        },
+        inline else => |tag| {
             try stderr.print("{s}: not yet implemented\n", .{@tagName(tag)});
             try stderr.flush();
         },
@@ -192,24 +308,4 @@ fn hasHelpFlag(args: []const [:0]const u8) bool {
 fn resolveDbPath(args: []const [:0]const u8, allocator: std.mem.Allocator) ![:0]const u8 {
     if (args.len >= 3) return args[2];
     return ken.defaultDbPath(allocator);
-}
-
-fn handleKind(
-    comptime entity: ken.KindEntity,
-    args: []const [:0]const u8,
-    stdout: anytype,
-    stderr: anytype,
-) !void {
-    const action = ken.parseKindArgs(args, 1) catch |err| {
-        if (err == error.HelpRequested) {
-            try stdout.print(ken.kindUsage(entity), .{});
-            try stdout.flush();
-            return;
-        }
-        try ken.formatKindError(entity, err, stderr);
-        try stderr.flush();
-        return;
-    };
-    try ken.executeKindAction(entity, action, stdout);
-    try stdout.flush();
 }

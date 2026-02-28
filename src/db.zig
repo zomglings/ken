@@ -3,6 +3,10 @@
 const std = @import("std");
 const c = @cImport(@cInclude("sqlite3.h"));
 
+// SQLITE_STATIC tells SQLite the bound data will outlive the statement.
+// Safe here because we always finalize before returning.
+const SQLITE_STATIC: c.sqlite3_destructor_type = null;
+
 pub const SqliteError = error{
     CantOpen,
     ExecFailed,
@@ -57,6 +61,57 @@ pub const Db = struct {
 
         rc = c.sqlite3_step(stmt.?);
         if (rc == c.SQLITE_ROW) return c.sqlite3_column_int64(stmt.?, 0);
+        if (rc == c.SQLITE_DONE) return null;
+        return error.StepFailed;
+    }
+
+    /// Prepare a statement, bind text parameters (1-indexed), step, and finalize.
+    /// Use for INSERT/UPDATE/DELETE with user-supplied text values.
+    pub fn execParams(self: *Db, sql: [*:0]const u8, params: []const ?[]const u8) SqliteError!void {
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.handle, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        for (params, 1..) |param, i| {
+            const idx: c_int = @intCast(i);
+            if (param) |p| {
+                rc = c.sqlite3_bind_text(stmt.?, idx, p.ptr, @intCast(p.len), SQLITE_STATIC);
+            } else {
+                rc = c.sqlite3_bind_null(stmt.?, idx);
+            }
+            if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        }
+
+        rc = c.sqlite3_step(stmt.?);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    /// Query a single text column from a single row, with text parameter bindings.
+    /// Returns null if no rows match. Caller must free the returned slice.
+    pub fn queryTextParams(self: *Db, allocator: std.mem.Allocator, sql: [*:0]const u8, params: []const ?[]const u8) (SqliteError || error{OutOfMemory})!?[]const u8 {
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.handle, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        for (params, 1..) |param, i| {
+            const idx: c_int = @intCast(i);
+            if (param) |p| {
+                rc = c.sqlite3_bind_text(stmt.?, idx, p.ptr, @intCast(p.len), SQLITE_STATIC);
+            } else {
+                rc = c.sqlite3_bind_null(stmt.?, idx);
+            }
+            if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        }
+
+        rc = c.sqlite3_step(stmt.?);
+        if (rc == c.SQLITE_ROW) {
+            const ptr = c.sqlite3_column_text(stmt.?, 0);
+            const len: usize = @intCast(c.sqlite3_column_bytes(stmt.?, 0));
+            if (ptr == null) return null;
+            return try allocator.dupe(u8, ptr[0..len]);
+        }
         if (rc == c.SQLITE_DONE) return null;
         return error.StepFailed;
     }
@@ -193,4 +248,68 @@ test "down-migration rejected" {
 
     const result = db.migrate(toy_migrations[0..2]);
     try testing.expectError(error.DatabaseAheadOfMigrations, result);
+}
+
+test "execParams: insert and query with bound text" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+
+    _ = try db.migrate(toy_migrations);
+
+    try db.execParams(
+        "INSERT INTO items (name, description) VALUES (?1, ?2);",
+        &.{ "test-item", "a description" },
+    );
+
+    const val = try db.queryInt("SELECT COUNT(*) FROM items WHERE name='test-item';");
+    try testing.expectEqual(@as(?i64, 1), val);
+}
+
+test "execParams: null parameter" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+
+    _ = try db.migrate(toy_migrations);
+
+    try db.execParams(
+        "INSERT INTO items (name, description) VALUES (?1, ?2);",
+        &.{ "null-desc", null },
+    );
+
+    const val = try db.queryInt("SELECT COUNT(*) FROM items WHERE name='null-desc' AND description IS NULL;");
+    try testing.expectEqual(@as(?i64, 1), val);
+}
+
+test "queryTextParams: returns matching text" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+
+    _ = try db.migrate(toy_migrations);
+
+    try db.execParams(
+        "INSERT INTO items (name, description) VALUES (?1, ?2);",
+        &.{ "findme", "the description" },
+    );
+
+    const result = try db.queryTextParams(
+        testing.allocator,
+        "SELECT description FROM items WHERE name = ?1;",
+        &.{"findme"},
+    );
+    defer if (result) |r| testing.allocator.free(r);
+    try testing.expectEqualStrings("the description", result.?);
+}
+
+test "queryTextParams: returns null for no rows" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+
+    _ = try db.migrate(toy_migrations);
+
+    const result = try db.queryTextParams(
+        testing.allocator,
+        "SELECT description FROM items WHERE name = ?1;",
+        &.{"nonexistent"},
+    );
+    try testing.expect(result == null);
 }
