@@ -131,6 +131,11 @@ pub fn main(process: std.process.Init) !void {
                 return;
             };
             defer database.close();
+            const prev = database.getVersion() catch {
+                try stderr.print("Error: could not read version from '{s}'\n", .{db_path});
+                try stderr.flush();
+                return;
+            };
             const v = database.migrate(ken.migrations) catch |err| {
                 if (err == error.DatabaseAheadOfMigrations) {
                     try stderr.print("Error: database is ahead of this version of ken\n", .{});
@@ -140,7 +145,11 @@ pub fn main(process: std.process.Init) !void {
                 try stderr.flush();
                 return;
             };
-            try stdout.print("Initialized ken database at {s} (version {d})\n", .{ db_path, v });
+            if (prev != null and prev.? == v) {
+                try stdout.print("Database at {s} already at version {d}, nothing to do\n", .{ db_path, v });
+            } else {
+                try stdout.print("Initialized ken database at {s} (version {d})\n", .{ db_path, v });
+            }
             try stdout.flush();
         },
         .dbversion => {
@@ -170,11 +179,6 @@ pub fn main(process: std.process.Init) !void {
         .add => {
             const action = ken.parseAddArgs(args, 1) catch |err| {
                 switch (err) {
-                    error.HelpRequested => {
-                        try stdout.print(ken.addUsage, .{});
-                        try stdout.flush();
-                        return;
-                    },
                     error.MissingArgument => try stderr.print("Error: missing argument. Usage: ken add <kind> [-k/--key <key>] [--title <title>]\n", .{}),
                     error.UnknownFlag => try stderr.print("Error: unknown flag. Usage: ken add <kind> [-k/--key <key>] [--title <title>]\n", .{}),
                     else => try stderr.print("Error: invalid arguments for 'add'\n", .{}),
@@ -196,32 +200,26 @@ pub fn main(process: std.process.Init) !void {
             defer database.close();
 
             // Validate that the kind exists
-            const kind_desc = database.queryTextParams(
-                arena,
-                "SELECT description FROM publication_kinds WHERE name = ?1;",
+            const kind_exists = database.exists(
+                "SELECT 1 FROM publication_kinds WHERE name = ?1;",
                 &.{action.kind},
             ) catch {
                 try stderr.print("Error: could not query database\n", .{});
                 try stderr.flush();
                 return;
             };
-            if (kind_desc == null) {
+            if (!kind_exists) {
                 try stderr.print("Error: unknown publication kind '{s}'\n", .{action.kind});
                 try stderr.flush();
                 return;
             }
 
-            // Generate UUID
-            var rand_bytes: [16]u8 = undefined;
-            process.io.random(&rand_bytes);
-            var uuid_buf: [36]u8 = undefined;
-            ken.uuidV4(&uuid_buf, &rand_bytes);
-            const uuid: []const u8 = &uuid_buf;
+            // Generate UUID and insert publication
+            const uuid = genUuid(process.io);
 
-            // Insert publication
             database.execParams(
                 "INSERT INTO publications (id, key, kind, title) VALUES (?1, ?2, ?3, ?4);",
-                &.{ uuid, action.key, action.kind, action.title },
+                &.{ &uuid, action.key, action.kind, action.title },
             ) catch {
                 try stderr.print("Error: could not insert publication\n", .{});
                 try stderr.flush();
@@ -231,26 +229,23 @@ pub fn main(process: std.process.Init) !void {
             // For notes with a file key, read file and insert into notes table
             if (std.mem.eql(u8, action.kind, "note")) {
                 if (action.key) |key| {
+                    const max_note_size = 10 * 1024 * 1024; // 10 MB
                     const file_content = blk: {
                         const file = Io.Dir.openFile(.cwd(), process.io, key, .{}) catch break :blk null;
                         defer file.close(process.io);
                         const stat = file.stat(process.io) catch break :blk null;
                         const size: usize = @intCast(stat.size);
-                        if (size == 0) break :blk null;
+                        if (size == 0 or size > max_note_size) break :blk null;
                         const buf = arena.alloc(u8, size) catch break :blk null;
                         const n = file.readPositionalAll(process.io, buf, 0) catch break :blk null;
                         break :blk buf[0..n];
                     };
                     if (file_content) |content| {
-                        var note_rand: [16]u8 = undefined;
-                        process.io.random(&note_rand);
-                        var note_uuid_buf: [36]u8 = undefined;
-                        ken.uuidV4(&note_uuid_buf, &note_rand);
-                        const note_uuid: []const u8 = &note_uuid_buf;
+                        const note_uuid = genUuid(process.io);
 
                         database.execParams(
                             "INSERT INTO notes (id, publication, body) VALUES (?1, ?2, ?3);",
-                            &.{ note_uuid, uuid, content },
+                            &.{ &note_uuid, &uuid, content },
                         ) catch {
                             try stderr.print("Error: could not insert note body\n", .{});
                             try stderr.flush();
@@ -260,35 +255,33 @@ pub fn main(process: std.process.Init) !void {
                 }
             }
 
-            try stdout.print("{s}\n", .{uuid});
+            try stdout.print("{s}\n", .{&uuid});
             try stdout.flush();
         },
-        .pubkind => {
+        inline .pubkind, .relkind => |tag| {
+            const entity = comptime std.meta.stringToEnum(ken.KindEntity, @tagName(tag)).?;
             const action = ken.parseKindArgs(args, 1) catch |err| {
-                if (err == error.HelpRequested) {
-                    try stdout.print(ken.kindUsage(.pubkind), .{});
-                    try stdout.flush();
-                    return;
-                }
-                try ken.formatKindError(.pubkind, err, stderr);
+                try ken.formatKindError(entity, err, stderr);
                 try stderr.flush();
                 return;
             };
-            try ken.executeKindAction(.pubkind, action, stdout);
-            try stdout.flush();
-        },
-        .relkind => {
-            const action = ken.parseKindArgs(args, 1) catch |err| {
-                if (err == error.HelpRequested) {
-                    try stdout.print(ken.kindUsage(.relkind), .{});
-                    try stdout.flush();
-                    return;
-                }
-                try ken.formatKindError(.relkind, err, stderr);
+
+            const db_path = ken.defaultDbPath(arena) catch {
+                try stderr.print("Error: could not determine default database path\n", .{});
                 try stderr.flush();
                 return;
             };
-            try ken.executeKindAction(.relkind, action, stdout);
+            var database = ken.db.Db.open(db_path) catch {
+                try stderr.print("Error: could not open database '{s}'\n", .{db_path});
+                try stderr.flush();
+                return;
+            };
+            defer database.close();
+
+            ken.executeKindAction(&database, arena, entity, action, stdout, stderr) catch {
+                try stderr.flush();
+                return;
+            };
             try stdout.flush();
         },
         inline else => |tag| {
@@ -308,4 +301,12 @@ fn hasHelpFlag(args: []const [:0]const u8) bool {
 fn resolveDbPath(args: []const [:0]const u8, allocator: std.mem.Allocator) ![:0]const u8 {
     if (args.len >= 3) return args[2];
     return ken.defaultDbPath(allocator);
+}
+
+fn genUuid(io: std.Io) [36]u8 {
+    var rand_bytes: [16]u8 = undefined;
+    io.random(&rand_bytes);
+    var buf: [36]u8 = undefined;
+    ken.uuidV4(&buf, &rand_bytes);
+    return buf;
 }

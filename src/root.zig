@@ -226,28 +226,172 @@ pub fn parseKindArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!Ki
     }
 }
 
-/// Stub executor — prints what the action would do. No database yet.
+pub const KindError = error{
+    NotFound,
+    AlreadyExists,
+    InUse,
+    SqlFailed,
+};
+
+/// Execute a pubkind/relkind action against the database.
 pub fn executeKindAction(
+    database: *db.Db,
+    allocator: std.mem.Allocator,
     entity: KindEntity,
     action: KindAction,
     stdout: anytype,
-) !void {
+    stderr: anytype,
+) KindError!void {
+    const table = entity.tableName();
     const lbl = entity.label();
+
     switch (action) {
-        .show => |v| try stdout.print("Would show {s} '{s}' (database not yet initialized)\n", .{ lbl, v.name }),
-        .list => |v| {
-            try stdout.print("Would list {s}s", .{lbl});
-            if (v.pagination.limit) |l| try stdout.print(" limit={d}", .{l});
-            if (v.pagination.offset) |o| try stdout.print(" offset={d}", .{o});
-            try stdout.print(" (database not yet initialized)\n", .{});
+        .show => |v| {
+            var sql_buf: [256]u8 = undefined;
+            const sql = std.fmt.bufPrintZ(
+                &sql_buf,
+                "SELECT description FROM {s} WHERE name = ?1;",
+                .{table},
+            ) catch unreachable;
+            const desc = database.queryTextParams(allocator, sql, &.{v.name}) catch return error.SqlFailed;
+            defer if (desc) |d| allocator.free(d);
+            if (desc) |d| {
+                stdout.print("{s}\t{s}\n", .{ v.name, d }) catch return error.SqlFailed;
+            } else {
+                stderr.print("Error: {s} '{s}' not found\n", .{ lbl, v.name }) catch {};
+                return error.NotFound;
+            }
         },
-        .add => |v| try stdout.print("Would add {s} '{s}': {s} (database not yet initialized)\n", .{ lbl, v.name, v.description }),
-        .remove => |v| try stdout.print("Would remove {s} '{s}' (database not yet initialized)\n", .{ lbl, v.name }),
+        .list => |v| {
+            var sql_buf: [256]u8 = undefined;
+            const sql = blk: {
+                if (v.pagination.limit) |lim| {
+                    if (v.pagination.offset) |off| {
+                        break :blk std.fmt.bufPrintZ(
+                            &sql_buf,
+                            "SELECT name, description FROM {s} ORDER BY name LIMIT {d} OFFSET {d};",
+                            .{ table, lim, off },
+                        ) catch unreachable;
+                    }
+                    break :blk std.fmt.bufPrintZ(
+                        &sql_buf,
+                        "SELECT name, description FROM {s} ORDER BY name LIMIT {d};",
+                        .{ table, lim },
+                    ) catch unreachable;
+                }
+                if (v.pagination.offset) |off| {
+                    break :blk std.fmt.bufPrintZ(
+                        &sql_buf,
+                        "SELECT name, description FROM {s} ORDER BY name LIMIT -1 OFFSET {d};",
+                        .{ table, off },
+                    ) catch unreachable;
+                }
+                break :blk std.fmt.bufPrintZ(
+                    &sql_buf,
+                    "SELECT name, description FROM {s} ORDER BY name;",
+                    .{table},
+                ) catch unreachable;
+            };
+            const rows = database.queryRows2(allocator, sql, &.{}) catch return error.SqlFailed;
+            defer db.Db.freeRows2(allocator, rows);
+            for (rows) |row| {
+                stdout.print("{s}\t{s}\n", .{ row[0], row[1] }) catch return error.SqlFailed;
+            }
+        },
+        .add => |v| {
+            var sql_buf: [256]u8 = undefined;
+            const sql = std.fmt.bufPrintZ(
+                &sql_buf,
+                "INSERT INTO {s} (name, description) VALUES (?1, ?2);",
+                .{table},
+            ) catch unreachable;
+            database.execParams(sql, &.{ v.name, v.description }) catch |err| {
+                if (err == error.ConstraintViolation) {
+                    stderr.print("Error: {s} '{s}' already exists\n", .{ lbl, v.name }) catch {};
+                    return error.AlreadyExists;
+                }
+                return error.SqlFailed;
+            };
+            stdout.print("{s}\t{s}\n", .{ v.name, v.description }) catch return error.SqlFailed;
+        },
+        .remove => |v| {
+            var sql_buf: [256]u8 = undefined;
+            const sql = std.fmt.bufPrintZ(
+                &sql_buf,
+                "DELETE FROM {s} WHERE name = ?1;",
+                .{table},
+            ) catch unreachable;
+            database.execParams(sql, &.{v.name}) catch |err| {
+                if (err == error.ConstraintViolation) {
+                    stderr.print("Error: {s} '{s}' is in use and cannot be removed\n", .{ lbl, v.name }) catch {};
+                    return error.InUse;
+                }
+                return error.SqlFailed;
+            };
+            stdout.print("Removed {s} '{s}'\n", .{ lbl, v.name }) catch return error.SqlFailed;
+        },
         .update => |v| {
-            try stdout.print("Would update {s} '{s}':", .{ lbl, v.name });
-            if (v.new_name) |n| try stdout.print(" name->'{s}'", .{n});
-            if (v.new_description) |d| try stdout.print(" description->'{s}'", .{d});
-            try stdout.print(" (database not yet initialized)\n", .{});
+            if (v.new_name) |new_name| {
+                // Rename requires updating child table references (no ON UPDATE CASCADE).
+                const child_table: []const u8 = switch (entity) {
+                    .pubkind => "publications",
+                    .relkind => "relationships",
+                };
+                database.exec("BEGIN;") catch return error.SqlFailed;
+                errdefer database.exec("ROLLBACK;") catch {};
+
+                // Update child references
+                var child_buf: [256]u8 = undefined;
+                const child_sql = std.fmt.bufPrintZ(
+                    &child_buf,
+                    "UPDATE {s} SET kind = ?1 WHERE kind = ?2;",
+                    .{child_table},
+                ) catch unreachable;
+                database.execParams(child_sql, &.{ new_name, v.name }) catch return error.SqlFailed;
+
+                // Update the kind row itself
+                var sql_buf: [256]u8 = undefined;
+                if (v.new_description) |new_desc| {
+                    const sql = std.fmt.bufPrintZ(
+                        &sql_buf,
+                        "UPDATE {s} SET name = ?1, description = ?2 WHERE name = ?3;",
+                        .{table},
+                    ) catch unreachable;
+                    database.execParams(sql, &.{ new_name, new_desc, v.name }) catch |err| {
+                        if (err == error.ConstraintViolation) {
+                            stderr.print("Error: {s} '{s}' already exists\n", .{ lbl, new_name }) catch {};
+                            return error.AlreadyExists;
+                        }
+                        return error.SqlFailed;
+                    };
+                } else {
+                    const sql = std.fmt.bufPrintZ(
+                        &sql_buf,
+                        "UPDATE {s} SET name = ?1 WHERE name = ?2;",
+                        .{table},
+                    ) catch unreachable;
+                    database.execParams(sql, &.{ new_name, v.name }) catch |err| {
+                        if (err == error.ConstraintViolation) {
+                            stderr.print("Error: {s} '{s}' already exists\n", .{ lbl, new_name }) catch {};
+                            return error.AlreadyExists;
+                        }
+                        return error.SqlFailed;
+                    };
+                }
+
+                database.exec("COMMIT;") catch return error.SqlFailed;
+                stdout.print("Updated {s} '{s}'\n", .{ lbl, v.name }) catch return error.SqlFailed;
+            } else {
+                // Description-only update, no rename
+                var sql_buf: [256]u8 = undefined;
+                const sql = std.fmt.bufPrintZ(
+                    &sql_buf,
+                    "UPDATE {s} SET description = ?1 WHERE name = ?2;",
+                    .{table},
+                ) catch unreachable;
+                database.execParams(sql, &.{ v.new_description.?, v.name }) catch return error.SqlFailed;
+                stdout.print("Updated {s} '{s}'\n", .{ lbl, v.name }) catch return error.SqlFailed;
+            }
         },
     }
 }
@@ -555,4 +699,187 @@ test "uuidV4: different input produces different output" {
     uuidV4(&buf1, &rand1);
     uuidV4(&buf2, &rand2);
     try testing.expect(!std.mem.eql(u8, &buf1, &buf2));
+}
+
+// ── executeKindAction tests ──
+
+fn testDb() !db.Db {
+    var database = try db.Db.open(":memory:");
+    _ = try database.migrate(migrations);
+    return database;
+}
+
+test "executeKindAction: add and show" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .add = .{ .name = "book", .description = "Keyed by ISBN" } }, &out, &err_w);
+    try testing.expectEqualStrings("book\tKeyed by ISBN\n", out.buffered());
+
+    out.end = 0;
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .show = .{ .name = "book" } }, &out, &err_w);
+    try testing.expectEqualStrings("book\tKeyed by ISBN\n", out.buffered());
+}
+
+test "executeKindAction: show not found" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const result = executeKindAction(&database, testing.allocator, .pubkind, .{ .show = .{ .name = "nonexistent" } }, &out, &err_w);
+    try testing.expectError(error.NotFound, result);
+    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "not found") != null);
+}
+
+test "executeKindAction: list with seeded kinds" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .list = .{ .pagination = .{} } }, &out, &err_w);
+    const output = out.buffered();
+    // Should contain seeded kinds (arxiv, note, video, web) sorted alphabetically
+    try testing.expect(std.mem.indexOf(u8, output, "arxiv\t") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "note\t") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "video\t") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "web\t") != null);
+}
+
+test "executeKindAction: list with pagination" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    // Limit 2 → first two alphabetically (arxiv, note)
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .list = .{ .pagination = .{ .limit = 2 } } }, &out, &err_w);
+    var lines: usize = 0;
+    for (out.buffered()) |ch| {
+        if (ch == '\n') lines += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), lines);
+
+    // Limit 2, offset 2 → next two (video, web)
+    out.end = 0;
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .list = .{ .pagination = .{ .limit = 2, .offset = 2 } } }, &out, &err_w);
+    const output = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output, "video\t") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "web\t") != null);
+}
+
+test "executeKindAction: duplicate add error" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .add = .{ .name = "book", .description = "Keyed by ISBN" } }, &out, &err_w);
+
+    out.end = 0;
+    const result = executeKindAction(&database, testing.allocator, .pubkind, .{ .add = .{ .name = "book", .description = "duplicate" } }, &out, &err_w);
+    try testing.expectError(error.AlreadyExists, result);
+    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "already exists") != null);
+}
+
+test "executeKindAction: remove" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .add = .{ .name = "book", .description = "Keyed by ISBN" } }, &out, &err_w);
+    out.end = 0;
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .remove = .{ .name = "book" } }, &out, &err_w);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "Removed") != null);
+
+    // Verify it's gone
+    out.end = 0;
+    const result = executeKindAction(&database, testing.allocator, .pubkind, .{ .show = .{ .name = "book" } }, &out, &err_w);
+    try testing.expectError(error.NotFound, result);
+}
+
+test "executeKindAction: update description" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .add = .{ .name = "book", .description = "Keyed by ISBN" } }, &out, &err_w);
+
+    out.end = 0;
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .update = .{ .name = "book", .new_description = "Keyed by ISBN-13" } }, &out, &err_w);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "Updated") != null);
+
+    out.end = 0;
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .show = .{ .name = "book" } }, &out, &err_w);
+    try testing.expectEqualStrings("book\tKeyed by ISBN-13\n", out.buffered());
+}
+
+test "executeKindAction: update with rename" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .add = .{ .name = "book", .description = "Keyed by ISBN" } }, &out, &err_w);
+
+    out.end = 0;
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .update = .{ .name = "book", .new_name = "tome" } }, &out, &err_w);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "Updated") != null);
+
+    // Old name should not be found
+    out.end = 0;
+    const result = executeKindAction(&database, testing.allocator, .pubkind, .{ .show = .{ .name = "book" } }, &out, &err_w);
+    try testing.expectError(error.NotFound, result);
+
+    // New name should work
+    out.end = 0;
+    err_w.end = 0;
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .show = .{ .name = "tome" } }, &out, &err_w);
+    try testing.expectEqualStrings("tome\tKeyed by ISBN\n", out.buffered());
+}
+
+test "executeKindAction: relkind add and list" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try executeKindAction(&database, testing.allocator, .relkind, .{ .add = .{ .name = "cites", .description = "Subject cites object" } }, &out, &err_w);
+    try testing.expectEqualStrings("cites\tSubject cites object\n", out.buffered());
+
+    out.end = 0;
+    try executeKindAction(&database, testing.allocator, .relkind, .{ .list = .{ .pagination = .{} } }, &out, &err_w);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "cites\t") != null);
 }

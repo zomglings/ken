@@ -12,6 +12,7 @@ pub const SqliteError = error{
     ExecFailed,
     PrepareFailed,
     StepFailed,
+    ConstraintViolation,
 };
 
 pub const MigrationError = error{
@@ -65,50 +66,58 @@ pub const Db = struct {
         return error.StepFailed;
     }
 
-    /// Prepare a statement, bind text parameters (1-indexed), step, and finalize.
-    /// Use for INSERT/UPDATE/DELETE with user-supplied text values.
-    pub fn execParams(self: *Db, sql: [*:0]const u8, params: []const ?[]const u8) SqliteError!void {
+    /// Prepare a statement and bind text parameters. Caller must finalize.
+    fn prepareAndBind(self: *Db, sql: [*:0]const u8, params: []const ?[]const u8) SqliteError!*c.sqlite3_stmt {
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self.handle, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
-        defer _ = c.sqlite3_finalize(stmt);
 
         for (params, 1..) |param, i| {
             const idx: c_int = @intCast(i);
-            if (param) |p| {
-                rc = c.sqlite3_bind_text(stmt.?, idx, p.ptr, @intCast(p.len), SQLITE_STATIC);
-            } else {
-                rc = c.sqlite3_bind_null(stmt.?, idx);
+            rc = if (param) |p|
+                c.sqlite3_bind_text(stmt.?, idx, p.ptr, @intCast(p.len), SQLITE_STATIC)
+            else
+                c.sqlite3_bind_null(stmt.?, idx);
+            if (rc != c.SQLITE_OK) {
+                _ = c.sqlite3_finalize(stmt);
+                return error.PrepareFailed;
             }
-            if (rc != c.SQLITE_OK) return error.PrepareFailed;
         }
 
-        rc = c.sqlite3_step(stmt.?);
-        if (rc != c.SQLITE_DONE) return error.StepFailed;
+        return stmt.?;
+    }
+
+    /// Prepare a statement, bind text parameters (1-indexed), step, and finalize.
+    /// Use for INSERT/UPDATE/DELETE with user-supplied text values.
+    /// Prepare a statement, bind text parameters (1-indexed), step, and finalize.
+    /// Use for INSERT/UPDATE/DELETE with user-supplied text values.
+    /// Returns ConstraintViolation for UNIQUE/FK violations.
+    pub fn execParams(self: *Db, sql: [*:0]const u8, params: []const ?[]const u8) SqliteError!void {
+        const stmt = try self.prepareAndBind(sql, params);
+        defer _ = c.sqlite3_finalize(stmt);
+
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return;
+        if (rc == c.SQLITE_CONSTRAINT) return error.ConstraintViolation;
+        // Also check extended error codes for constraint sub-types
+        const ext = c.sqlite3_extended_errcode(self.handle);
+        if (ext == c.SQLITE_CONSTRAINT_UNIQUE or
+            ext == c.SQLITE_CONSTRAINT_PRIMARYKEY or
+            ext == c.SQLITE_CONSTRAINT_FOREIGNKEY)
+            return error.ConstraintViolation;
+        return error.StepFailed;
     }
 
     /// Query a single text column from a single row, with text parameter bindings.
     /// Returns null if no rows match. Caller must free the returned slice.
     pub fn queryTextParams(self: *Db, allocator: std.mem.Allocator, sql: [*:0]const u8, params: []const ?[]const u8) (SqliteError || error{OutOfMemory})!?[]const u8 {
-        var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(self.handle, sql, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        const stmt = try self.prepareAndBind(sql, params);
         defer _ = c.sqlite3_finalize(stmt);
 
-        for (params, 1..) |param, i| {
-            const idx: c_int = @intCast(i);
-            if (param) |p| {
-                rc = c.sqlite3_bind_text(stmt.?, idx, p.ptr, @intCast(p.len), SQLITE_STATIC);
-            } else {
-                rc = c.sqlite3_bind_null(stmt.?, idx);
-            }
-            if (rc != c.SQLITE_OK) return error.PrepareFailed;
-        }
-
-        rc = c.sqlite3_step(stmt.?);
+        const rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_ROW) {
-            const ptr = c.sqlite3_column_text(stmt.?, 0);
-            const len: usize = @intCast(c.sqlite3_column_bytes(stmt.?, 0));
+            const ptr = c.sqlite3_column_text(stmt, 0);
+            const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
             if (ptr == null) return null;
             return try allocator.dupe(u8, ptr[0..len]);
         }
@@ -116,12 +125,67 @@ pub const Db = struct {
         return error.StepFailed;
     }
 
+    /// Check if a row exists matching the given parameterized query.
+    pub fn exists(self: *Db, sql: [*:0]const u8, params: []const ?[]const u8) SqliteError!bool {
+        const stmt = try self.prepareAndBind(sql, params);
+        defer _ = c.sqlite3_finalize(stmt);
+
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) return true;
+        if (rc == c.SQLITE_DONE) return false;
+        return error.StepFailed;
+    }
+
+    /// Query all rows returning two text columns. Returns [][2][]const u8.
+    /// Caller must call freeRows2 to release memory.
+    pub fn queryRows2(self: *Db, allocator: std.mem.Allocator, sql: [*:0]const u8, params: []const ?[]const u8) (SqliteError || error{OutOfMemory})![][2][]const u8 {
+        const stmt = try self.prepareAndBind(sql, params);
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var rows: std.ArrayList([2][]const u8) = .empty;
+        errdefer {
+            for (rows.items) |row| {
+                allocator.free(row[0]);
+                allocator.free(row[1]);
+            }
+            rows.deinit(allocator);
+        }
+
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+            const col0_ptr = c.sqlite3_column_text(stmt, 0);
+            const col0_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+            const col1_ptr = c.sqlite3_column_text(stmt, 1);
+            const col1_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+
+            const s0 = if (col0_ptr != null) try allocator.dupe(u8, col0_ptr[0..col0_len]) else try allocator.dupe(u8, "");
+            errdefer allocator.free(s0);
+            const s1 = if (col1_ptr != null) try allocator.dupe(u8, col1_ptr[0..col1_len]) else try allocator.dupe(u8, "");
+
+            try rows.append(allocator, .{ s0, s1 });
+        }
+
+        return rows.toOwnedSlice(allocator);
+    }
+
+    /// Free rows returned by queryRows2.
+    pub fn freeRows2(allocator: std.mem.Allocator, rows: [][2][]const u8) void {
+        for (rows) |row| {
+            allocator.free(row[0]);
+            allocator.free(row[1]);
+        }
+        allocator.free(rows);
+    }
+
     /// Returns the current schema version, or null if _ken_meta doesn't exist.
     pub fn getVersion(self: *Db) SqliteError!?u32 {
-        const exists = try self.queryInt(
+        const has_meta = try self.queryInt(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_ken_meta' LIMIT 1;",
         );
-        if (exists == null) return null;
+        if (has_meta == null) return null;
         return self.readVersion();
     }
 
@@ -147,8 +211,10 @@ pub const Db = struct {
         const target: u32 = @intCast(migrations.len);
 
         if (current) |v| {
-            if (v >= target) {
-                if (v > target) return error.DatabaseAheadOfMigrations;
+            // v is 0-indexed (version i means migrations 0..i have run),
+            // so v+1 is the count of migrations already applied.
+            if (v + 1 >= target) {
+                if (v + 1 > target) return error.DatabaseAheadOfMigrations;
                 return v;
             }
         }
@@ -312,4 +378,75 @@ test "queryTextParams: returns null for no rows" {
         &.{"nonexistent"},
     );
     try testing.expect(result == null);
+}
+
+test "execParams: constraint violation on duplicate PK" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+
+    _ = try db.migrate(toy_migrations);
+
+    try db.execParams(
+        "INSERT INTO items (id, name) VALUES (?1, ?2);",
+        &.{ "1", "first" },
+    );
+
+    const result = db.execParams(
+        "INSERT INTO items (id, name) VALUES (?1, ?2);",
+        &.{ "1", "duplicate" },
+    );
+    try testing.expectError(error.ConstraintViolation, result);
+}
+
+test "execParams: constraint violation on DELETE RESTRICT" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+
+    _ = try db.migrate(toy_migrations);
+
+    try db.execParams("INSERT INTO items (id, name) VALUES (?1, ?2);", &.{ "1", "item1" });
+    try db.execParams("INSERT INTO tags (id, item_id, tag) VALUES (?1, ?2, ?3);", &.{ "1", "1", "tagged" });
+
+    // Should fail because tag references item
+    const result = db.execParams("DELETE FROM items WHERE id = ?1;", &.{"1"});
+    try testing.expectError(error.ConstraintViolation, result);
+}
+
+test "queryRows2: multi-row result" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+
+    _ = try db.migrate(toy_migrations);
+
+    try db.execParams("INSERT INTO items (name, description) VALUES (?1, ?2);", &.{ "alpha", "first" });
+    try db.execParams("INSERT INTO items (name, description) VALUES (?1, ?2);", &.{ "beta", "second" });
+
+    const rows = try db.queryRows2(
+        testing.allocator,
+        "SELECT name, description FROM items ORDER BY name;",
+        &.{},
+    );
+    defer Db.freeRows2(testing.allocator, rows);
+
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("alpha", rows[0][0]);
+    try testing.expectEqualStrings("first", rows[0][1]);
+    try testing.expectEqualStrings("beta", rows[1][0]);
+    try testing.expectEqualStrings("second", rows[1][1]);
+}
+
+test "queryRows2: empty result" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+
+    _ = try db.migrate(toy_migrations);
+
+    const rows = try db.queryRows2(
+        testing.allocator,
+        "SELECT name, description FROM items ORDER BY name;",
+        &.{},
+    );
+    defer Db.freeRows2(testing.allocator, rows);
+
+    try testing.expectEqual(@as(usize, 0), rows.len);
 }
