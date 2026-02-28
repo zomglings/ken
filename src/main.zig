@@ -3,7 +3,10 @@ const ken = @import("ken");
 const Io = std.Io;
 
 const usage =
-    \\Usage: ken <command> [options]
+    \\Usage: ken [-d <path>] <command> [options]
+    \\
+    \\Options:
+    \\  -d, --db <path>  Path to ken database (default: platform-specific)
     \\
     \\Commands:
     \\  version    Print ken version
@@ -41,9 +44,9 @@ const Command = enum {
 fn printCommandUsage(cmd: Command, stdout: anytype) !void {
     switch (cmd) {
         .version => try stdout.writeAll("Usage: ken version\n\nPrint ken version.\n"),
-        .init => try stdout.writeAll("Usage: ken init [path]\n\nCreate or upgrade a ken database.\nIf no path is given, uses the default location.\n"),
+        .init => try stdout.writeAll("Usage: ken [-d <path>] init\n\nCreate or upgrade a ken database.\nIf -d is not given, uses the default location.\n"),
         .initpath => try stdout.writeAll("Usage: ken initpath\n\nPrint the default database path for this platform.\n"),
-        .dbversion => try stdout.writeAll("Usage: ken dbversion [path]\n\nPrint schema version of a ken database.\nIf no path is given, uses the default location.\n"),
+        .dbversion => try stdout.writeAll("Usage: ken [-d <path>] dbversion\n\nPrint schema version of a ken database.\nIf -d is not given, uses the default location.\n"),
         .add => try stdout.writeAll(ken.addUsage),
         .pubkind => try stdout.writeAll(ken.kindUsage(.pubkind)),
         .relkind => try stdout.writeAll(ken.kindUsage(.relkind)),
@@ -54,7 +57,7 @@ fn printCommandUsage(cmd: Command, stdout: anytype) !void {
 
 pub fn main(process: std.process.Init) !void {
     const arena = process.arena.allocator();
-    const args = try process.minimal.args.toSlice(arena);
+    const raw_args = try process.minimal.args.toSlice(arena);
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), process.io, &stdout_buf);
@@ -63,6 +66,28 @@ pub fn main(process: std.process.Init) !void {
     var stderr_buf: [4096]u8 = undefined;
     var stderr_writer: Io.File.Writer = .init(.stderr(), process.io, &stderr_buf);
     const stderr = &stderr_writer.interface;
+
+    // Extract -d/--db from args and build filtered args
+    var explicit_db_path: ?[:0]const u8 = null;
+    var filtered: std.ArrayList([:0]const u8) = .empty;
+    {
+        var i: usize = 0;
+        while (i < raw_args.len) : (i += 1) {
+            const arg: []const u8 = raw_args[i];
+            if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--db")) {
+                i += 1;
+                if (i >= raw_args.len) {
+                    try stderr.print("Error: -d/--db requires a path argument\n", .{});
+                    try stderr.flush();
+                    return;
+                }
+                explicit_db_path = raw_args[i];
+            } else {
+                try filtered.append(arena, raw_args[i]);
+            }
+        }
+    }
+    const args = filtered.items;
 
     if (args.len < 2) {
         try stderr.print(usage, .{});
@@ -108,12 +133,12 @@ pub fn main(process: std.process.Init) !void {
             try stdout.flush();
         },
         .init => {
-            const db_path = resolveDbPath(args, arena) catch {
+            const db_path: [:0]const u8 = explicit_db_path orelse (ken.defaultDbPath(arena) catch {
                 try stderr.print("Error: could not determine default database path\n", .{});
                 try stderr.flush();
                 return;
-            };
-            if (args.len < 3) {
+            });
+            if (explicit_db_path == null) {
                 if (std.fs.path.dirname(db_path)) |dir_path| {
                     Io.Dir.createDirAbsolute(process.io, dir_path, .default_dir) catch |err| switch (err) {
                         error.PathAlreadyExists => {},
@@ -153,11 +178,11 @@ pub fn main(process: std.process.Init) !void {
             try stdout.flush();
         },
         .dbversion => {
-            const db_path = resolveDbPath(args, arena) catch {
+            const db_path: [:0]const u8 = explicit_db_path orelse (ken.defaultDbPath(arena) catch {
                 try stderr.print("Error: could not determine default database path\n", .{});
                 try stderr.flush();
                 return;
-            };
+            });
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
@@ -187,11 +212,11 @@ pub fn main(process: std.process.Init) !void {
                 return;
             };
 
-            const db_path = ken.defaultDbPath(arena) catch {
+            const db_path: [:0]const u8 = explicit_db_path orelse (ken.defaultDbPath(arena) catch {
                 try stderr.print("Error: could not determine default database path\n", .{});
                 try stderr.flush();
                 return;
-            };
+            });
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
@@ -266,11 +291,11 @@ pub fn main(process: std.process.Init) !void {
                 return;
             };
 
-            const db_path = ken.defaultDbPath(arena) catch {
+            const db_path: [:0]const u8 = explicit_db_path orelse (ken.defaultDbPath(arena) catch {
                 try stderr.print("Error: could not determine default database path\n", .{});
                 try stderr.flush();
                 return;
-            };
+            });
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
@@ -296,11 +321,6 @@ fn hasHelpFlag(args: []const [:0]const u8) bool {
         if (ken.isHelpFlag(arg)) return true;
     }
     return false;
-}
-
-fn resolveDbPath(args: []const [:0]const u8, allocator: std.mem.Allocator) ![:0]const u8 {
-    if (args.len >= 3) return args[2];
-    return ken.defaultDbPath(allocator);
 }
 
 fn genUuid(io: std.Io) [36]u8 {

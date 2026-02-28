@@ -71,10 +71,10 @@ pub const migrations: []const [*:0]const u8 = &.{
     \\  created_at TEXT NOT NULL DEFAULT (datetime('now')),
     \\  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     \\);
-    \\INSERT INTO publication_kinds (name, description) VALUES ('note', 'A researcher''s own note or annotation. The key field is unused. The note body is stored in the notes table, linked by publication id.');
-    \\INSERT INTO publication_kinds (name, description) VALUES ('arxiv', 'A preprint on arXiv. The key is the arXiv identifier (e.g. 2301.07041 or math.AG/0601185).');
-    \\INSERT INTO publication_kinds (name, description) VALUES ('video', 'A YouTube video. The key is the YouTube video ID (the v parameter, e.g. dQw4w9WgXcQ).');
-    \\INSERT INTO publication_kinds (name, description) VALUES ('web', 'A web page or online resource. The key is the full URL.');
+    \\INSERT INTO publication_kinds (name, description) VALUES ('note', 'A researcher''s own note or annotation. The key field is optional; when provided it is treated as a local file path and the file contents are read into the notes table at creation time. The note body is stored in the notes table, linked to the publication by its id. Notes are the primary way researchers record their own thoughts, questions, and observations alongside the literature they are tracking.');
+    \\INSERT INTO publication_kinds (name, description) VALUES ('arxiv', 'A preprint hosted on arXiv (arxiv.org). The key is the arXiv identifier, e.g. "2301.07041" for recent papers or "math.AG/0601185" for older ones. To construct the abstract page URL, use https://arxiv.org/abs/{key}. To get the PDF directly, use https://arxiv.org/pdf/{key}. The arXiv API endpoint for metadata is http://export.arxiv.org/api/query?id_list={key}.');
+    \\INSERT INTO publication_kinds (name, description) VALUES ('video', 'A YouTube video. The key is the YouTube video ID, which is the 11-character v parameter from a watch URL. To construct the watch URL, use https://www.youtube.com/watch?v={key}. To construct a thumbnail URL, use https://img.youtube.com/vi/{key}/0.jpg. To construct an embed URL, use https://www.youtube.com/embed/{key}.');
+    \\INSERT INTO publication_kinds (name, description) VALUES ('web', 'A web page or online resource. The key is the full URL including the scheme (e.g. https://example.com/page). No transformation is needed to visit the resource; the key itself is the link. This is the most general publication kind and can be used for any online resource that does not fit a more specific kind.');
     ,
 };
 
@@ -119,7 +119,7 @@ pub const Pagination = struct {
 
 pub const KindAction = union(KindSubcommand) {
     show: struct { name: []const u8 },
-    list: struct { pagination: Pagination },
+    list: struct { pagination: Pagination, descriptions: bool = false },
     add: struct { name: []const u8, description: []const u8 },
     remove: struct { name: []const u8 },
     update: struct { name: []const u8, new_name: ?[]const u8 = null, new_description: ?[]const u8 = null },
@@ -145,7 +145,7 @@ pub fn kindUsage(comptime entity: KindEntity) []const u8 {
         "\nManage " ++ lbl ++ "s.\n" ++
         "\nSubcommands:\n" ++
         "  show <name>                                Show a " ++ lbl ++ "\n" ++
-        "  list [--limit N] [--offset N]              List " ++ lbl ++ "s\n" ++
+        "  list [--limit N] [--offset N] [--descriptions] List " ++ lbl ++ "s\n" ++
         "  add <name> <description>                   Add a " ++ lbl ++ "\n" ++
         "  remove <name>                              Remove a " ++ lbl ++ "\n" ++
         "  update <name> [--name N] [--description D] Update a " ++ lbl ++ "\n";
@@ -176,6 +176,7 @@ pub fn parseKindArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!Ki
         },
         .list => {
             var pagination = Pagination{};
+            var descriptions = false;
             var i: usize = 0;
             while (i < rest.len) : (i += 1) {
                 const arg: []const u8 = rest[i];
@@ -189,11 +190,13 @@ pub fn parseKindArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!Ki
                     if (i >= rest.len) return error.MissingArgument;
                     pagination.offset = std.fmt.parseInt(u32, rest[i], 10) catch
                         return error.InvalidNumber;
+                } else if (std.mem.eql(u8, arg, "--descriptions")) {
+                    descriptions = true;
                 } else {
                     return error.UnknownFlag;
                 }
             }
-            return .{ .list = .{ .pagination = pagination } };
+            return .{ .list = .{ .pagination = pagination, .descriptions = descriptions } };
         },
         .add => {
             if (rest.len < 2) return error.MissingArgument;
@@ -240,6 +243,28 @@ pub const KindError = error{
     SqlFailed,
 };
 
+/// Write a JSON-escaped string (including surrounding quotes) to the writer.
+pub fn writeJsonString(writer: anytype, str: []const u8) !void {
+    try writer.writeAll("\"");
+    for (str) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\t' => try writer.writeAll("\\t"),
+            '\r' => try writer.writeAll("\\r"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0c => try writer.writeAll("\\f"),
+            0x00...0x07, 0x0b, 0x0e...0x1f => {
+                const hex = "0123456789abcdef";
+                try writer.writeAll(&[6]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] });
+            },
+            else => try writer.writeAll(&[1]u8{c}),
+        }
+    }
+    try writer.writeAll("\"");
+}
+
 /// Execute a pubkind/relkind action against the database.
 pub fn executeKindAction(
     database: *db.Db,
@@ -263,7 +288,11 @@ pub fn executeKindAction(
             const desc = database.queryTextParams(allocator, sql, &.{v.name}) catch return error.SqlFailed;
             defer if (desc) |d| allocator.free(d);
             if (desc) |d| {
-                stdout.print("{s}\t{s}\n", .{ v.name, d }) catch return error.SqlFailed;
+                stdout.writeAll("{\"name\":") catch return error.SqlFailed;
+                writeJsonString(stdout, v.name) catch return error.SqlFailed;
+                stdout.writeAll(",\"description\":") catch return error.SqlFailed;
+                writeJsonString(stdout, d) catch return error.SqlFailed;
+                stdout.writeAll("}\n") catch return error.SqlFailed;
             } else {
                 stderr.print("Error: {s} '{s}' not found\n", .{ lbl, v.name }) catch {};
                 return error.NotFound;
@@ -280,9 +309,18 @@ pub fn executeKindAction(
             ) catch unreachable;
             const rows = database.queryRows2(allocator, sql, &.{}) catch return error.SqlFailed;
             defer db.Db.freeRows2(allocator, rows);
-            for (rows) |row| {
-                stdout.print("{s}\t{s}\n", .{ row[0], row[1] }) catch return error.SqlFailed;
+            stdout.writeAll("[") catch return error.SqlFailed;
+            for (rows, 0..) |row, idx| {
+                if (idx > 0) stdout.writeAll(",") catch return error.SqlFailed;
+                stdout.writeAll("{\"name\":") catch return error.SqlFailed;
+                writeJsonString(stdout, row[0]) catch return error.SqlFailed;
+                if (v.descriptions) {
+                    stdout.writeAll(",\"description\":") catch return error.SqlFailed;
+                    writeJsonString(stdout, row[1]) catch return error.SqlFailed;
+                }
+                stdout.writeAll("}") catch return error.SqlFailed;
             }
+            stdout.writeAll("]\n") catch return error.SqlFailed;
         },
         .add => |v| {
             var sql_buf: [256]u8 = undefined;
@@ -298,7 +336,11 @@ pub fn executeKindAction(
                 }
                 return error.SqlFailed;
             };
-            stdout.print("{s}\t{s}\n", .{ v.name, v.description }) catch return error.SqlFailed;
+            stdout.writeAll("{\"name\":") catch return error.SqlFailed;
+            writeJsonString(stdout, v.name) catch return error.SqlFailed;
+            stdout.writeAll(",\"description\":") catch return error.SqlFailed;
+            writeJsonString(stdout, v.description) catch return error.SqlFailed;
+            stdout.writeAll("}\n") catch return error.SqlFailed;
         },
         .remove => |v| {
             var sql_buf: [256]u8 = undefined;
@@ -318,7 +360,9 @@ pub fn executeKindAction(
                 stderr.print("Error: {s} '{s}' not found\n", .{ lbl, v.name }) catch {};
                 return error.NotFound;
             }
-            stdout.print("Removed {s} '{s}'\n", .{ lbl, v.name }) catch return error.SqlFailed;
+            stdout.writeAll("{\"name\":") catch return error.SqlFailed;
+            writeJsonString(stdout, v.name) catch return error.SqlFailed;
+            stdout.writeAll(",\"removed\":true}\n") catch return error.SqlFailed;
         },
         .update => |v| {
             if (v.new_name) |new_name| {
@@ -373,7 +417,10 @@ pub fn executeKindAction(
                 ) catch unreachable;
                 database.execParams(sql, &.{ v.new_description.?, v.name }) catch return error.SqlFailed;
             }
-            stdout.print("Updated {s} '{s}'\n", .{ lbl, v.name }) catch return error.SqlFailed;
+            const final_name = v.new_name orelse v.name;
+            stdout.writeAll("{\"name\":") catch return error.SqlFailed;
+            writeJsonString(stdout, final_name) catch return error.SqlFailed;
+            stdout.writeAll(",\"updated\":true}\n") catch return error.SqlFailed;
         },
     }
 }
@@ -701,11 +748,11 @@ test "executeKindAction: add and show" {
     var err_w: std.Io.Writer = .fixed(&err_buf);
 
     try executeKindAction(&database, testing.allocator, .pubkind, .{ .add = .{ .name = "book", .description = "Keyed by ISBN" } }, &out, &err_w);
-    try testing.expectEqualStrings("book\tKeyed by ISBN\n", out.buffered());
+    try testing.expectEqualStrings("{\"name\":\"book\",\"description\":\"Keyed by ISBN\"}\n", out.buffered());
 
     out.end = 0;
     try executeKindAction(&database, testing.allocator, .pubkind, .{ .show = .{ .name = "book" } }, &out, &err_w);
-    try testing.expectEqualStrings("book\tKeyed by ISBN\n", out.buffered());
+    try testing.expectEqualStrings("{\"name\":\"book\",\"description\":\"Keyed by ISBN\"}\n", out.buffered());
 }
 
 test "executeKindAction: show not found" {
@@ -734,10 +781,12 @@ test "executeKindAction: list with seeded kinds" {
     try executeKindAction(&database, testing.allocator, .pubkind, .{ .list = .{ .pagination = .{} } }, &out, &err_w);
     const output = out.buffered();
     // Should contain seeded kinds (arxiv, note, video, web) sorted alphabetically
-    try testing.expect(std.mem.indexOf(u8, output, "arxiv\t") != null);
-    try testing.expect(std.mem.indexOf(u8, output, "note\t") != null);
-    try testing.expect(std.mem.indexOf(u8, output, "video\t") != null);
-    try testing.expect(std.mem.indexOf(u8, output, "web\t") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"name\":\"arxiv\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"name\":\"note\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"name\":\"video\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"name\":\"web\"") != null);
+    // Default list should not include descriptions
+    try testing.expect(std.mem.indexOf(u8, output, "\"description\"") == null);
 }
 
 test "executeKindAction: list with pagination" {
@@ -751,18 +800,17 @@ test "executeKindAction: list with pagination" {
 
     // Limit 2 → first two alphabetically (arxiv, note)
     try executeKindAction(&database, testing.allocator, .pubkind, .{ .list = .{ .pagination = .{ .limit = 2 } } }, &out, &err_w);
-    var lines: usize = 0;
-    for (out.buffered()) |ch| {
-        if (ch == '\n') lines += 1;
-    }
-    try testing.expectEqual(@as(usize, 2), lines);
+    const output1 = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output1, "\"name\":\"arxiv\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output1, "\"name\":\"note\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output1, "\"name\":\"video\"") == null);
 
     // Limit 2, offset 2 → next two (video, web)
     out.end = 0;
     try executeKindAction(&database, testing.allocator, .pubkind, .{ .list = .{ .pagination = .{ .limit = 2, .offset = 2 } } }, &out, &err_w);
-    const output = out.buffered();
-    try testing.expect(std.mem.indexOf(u8, output, "video\t") != null);
-    try testing.expect(std.mem.indexOf(u8, output, "web\t") != null);
+    const output2 = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output2, "\"name\":\"video\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output2, "\"name\":\"web\"") != null);
 }
 
 test "executeKindAction: duplicate add error" {
@@ -794,7 +842,7 @@ test "executeKindAction: remove" {
     try executeKindAction(&database, testing.allocator, .pubkind, .{ .add = .{ .name = "book", .description = "Keyed by ISBN" } }, &out, &err_w);
     out.end = 0;
     try executeKindAction(&database, testing.allocator, .pubkind, .{ .remove = .{ .name = "book" } }, &out, &err_w);
-    try testing.expect(std.mem.indexOf(u8, out.buffered(), "Removed") != null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"removed\":true") != null);
 
     // Verify it's gone
     out.end = 0;
@@ -829,11 +877,11 @@ test "executeKindAction: update description" {
 
     out.end = 0;
     try executeKindAction(&database, testing.allocator, .pubkind, .{ .update = .{ .name = "book", .new_description = "Keyed by ISBN-13" } }, &out, &err_w);
-    try testing.expect(std.mem.indexOf(u8, out.buffered(), "Updated") != null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"updated\":true") != null);
 
     out.end = 0;
     try executeKindAction(&database, testing.allocator, .pubkind, .{ .show = .{ .name = "book" } }, &out, &err_w);
-    try testing.expectEqualStrings("book\tKeyed by ISBN-13\n", out.buffered());
+    try testing.expectEqualStrings("{\"name\":\"book\",\"description\":\"Keyed by ISBN-13\"}\n", out.buffered());
 }
 
 test "executeKindAction: update with rename" {
@@ -849,7 +897,7 @@ test "executeKindAction: update with rename" {
 
     out.end = 0;
     try executeKindAction(&database, testing.allocator, .pubkind, .{ .update = .{ .name = "book", .new_name = "tome" } }, &out, &err_w);
-    try testing.expect(std.mem.indexOf(u8, out.buffered(), "Updated") != null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"updated\":true") != null);
 
     // Old name should not be found
     out.end = 0;
@@ -860,7 +908,7 @@ test "executeKindAction: update with rename" {
     out.end = 0;
     err_w.end = 0;
     try executeKindAction(&database, testing.allocator, .pubkind, .{ .show = .{ .name = "tome" } }, &out, &err_w);
-    try testing.expectEqualStrings("tome\tKeyed by ISBN\n", out.buffered());
+    try testing.expectEqualStrings("{\"name\":\"tome\",\"description\":\"Keyed by ISBN\"}\n", out.buffered());
 }
 
 test "executeKindAction: relkind add and list" {
@@ -873,9 +921,59 @@ test "executeKindAction: relkind add and list" {
     var err_w: std.Io.Writer = .fixed(&err_buf);
 
     try executeKindAction(&database, testing.allocator, .relkind, .{ .add = .{ .name = "cites", .description = "Subject cites object" } }, &out, &err_w);
-    try testing.expectEqualStrings("cites\tSubject cites object\n", out.buffered());
+    try testing.expectEqualStrings("{\"name\":\"cites\",\"description\":\"Subject cites object\"}\n", out.buffered());
 
     out.end = 0;
     try executeKindAction(&database, testing.allocator, .relkind, .{ .list = .{ .pagination = .{} } }, &out, &err_w);
-    try testing.expect(std.mem.indexOf(u8, out.buffered(), "cites\t") != null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"name\":\"cites\"") != null);
+}
+
+test "list: --descriptions flag" {
+    const args = mkArgs(&.{ "ken", "pubkind", "list", "--descriptions" });
+    const action = try parseKindArgs(&args, 1);
+    try testing.expect(action.list.descriptions == true);
+    try testing.expect(action.list.pagination.limit == null);
+}
+
+test "list: --descriptions with --limit" {
+    const args = mkArgs(&.{ "ken", "pubkind", "list", "--descriptions", "--limit", "5" });
+    const action = try parseKindArgs(&args, 1);
+    try testing.expect(action.list.descriptions == true);
+    try testing.expectEqual(@as(u32, 5), action.list.pagination.limit.?);
+}
+
+test "executeKindAction: list with --descriptions" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [16384]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try executeKindAction(&database, testing.allocator, .pubkind, .{ .list = .{ .pagination = .{}, .descriptions = true } }, &out, &err_w);
+    const output = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output, "\"description\":") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"name\":\"arxiv\"") != null);
+}
+
+test "writeJsonString: plain text" {
+    var buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try writeJsonString(&out, "hello");
+    try testing.expectEqualStrings("\"hello\"", out.buffered());
+}
+
+test "writeJsonString: escapes quotes and backslashes" {
+    var buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try writeJsonString(&out, "say \"hi\" \\ there");
+    try testing.expectEqualStrings("\"say \\\"hi\\\" \\\\ there\"", out.buffered());
+}
+
+test "writeJsonString: escapes newlines and tabs" {
+    var buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try writeJsonString(&out, "line1\nline2\tend");
+    try testing.expectEqualStrings("\"line1\\nline2\\tend\"", out.buffered());
 }
