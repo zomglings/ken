@@ -41,6 +41,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // Embed the SQLite amalgamation so that src/db.zig can @cImport it.
+    mod.addCSourceFile(.{
+        .file = b.path("lib/sqlite3.c"),
+        .flags = &.{"-DSQLITE_OMIT_LOAD_EXTENSION"},
+    });
+    mod.addIncludePath(b.path("lib"));
+    mod.link_libc = true;
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business

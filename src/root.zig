@@ -1,6 +1,45 @@
 //! ken: a research literature catalog.
 
 const std = @import("std");
+pub const db = @import("db.zig");
+
+pub const version: u32 = 0;
+
+/// Ken schema migrations. Index = version number.
+pub const migrations: []const [*:0]const u8 = &.{
+    \\CREATE TABLE publication_kinds (
+    \\  name TEXT PRIMARY KEY,
+    \\  description TEXT NOT NULL
+    \\);
+    \\CREATE TABLE relationship_kinds (
+    \\  name TEXT PRIMARY KEY,
+    \\  description TEXT NOT NULL
+    \\);
+    \\CREATE TABLE publications (
+    \\  id TEXT PRIMARY KEY,
+    \\  key TEXT,
+    \\  kind TEXT NOT NULL REFERENCES publication_kinds(name) ON DELETE RESTRICT,
+    \\  title TEXT,
+    \\  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    \\  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    \\);
+    \\CREATE TABLE relationships (
+    \\  id TEXT PRIMARY KEY,
+    \\  subject TEXT NOT NULL REFERENCES publications(id) ON DELETE RESTRICT,
+    \\  object TEXT NOT NULL REFERENCES publications(id) ON DELETE RESTRICT,
+    \\  kind TEXT NOT NULL REFERENCES relationship_kinds(name) ON DELETE RESTRICT,
+    \\  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    \\);
+    \\CREATE TABLE notes (
+    \\  id TEXT PRIMARY KEY,
+    \\  publication TEXT NOT NULL REFERENCES publications(id) ON DELETE CASCADE,
+    \\  body TEXT NOT NULL,
+    \\  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    \\  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    \\);
+    \\INSERT INTO publication_kinds (name, description) VALUES ('note', 'A note. The key field is unused.');
+    ,
+};
 
 pub const KindEntity = enum {
     pubkind,
@@ -49,7 +88,24 @@ pub const ParseError = error{
     InvalidNumber,
     MissingUpdateField,
     UnknownFlag,
+    HelpRequested,
 };
+
+pub fn isHelpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
+}
+
+pub fn kindUsage(comptime entity: KindEntity) []const u8 {
+    const lbl = comptime entity.label();
+    return "Usage: ken " ++ @tagName(entity) ++ " <subcommand> [options]\n" ++
+        "\nManage " ++ lbl ++ "s.\n" ++
+        "\nSubcommands:\n" ++
+        "  show <name>                                Show a " ++ lbl ++ "\n" ++
+        "  list [--limit N] [--offset N]              List " ++ lbl ++ "s\n" ++
+        "  add <name> <description>                   Add a " ++ lbl ++ "\n" ++
+        "  remove <name>                              Remove a " ++ lbl ++ "\n" ++
+        "  update <name> [--name N] [--description D] Update a " ++ lbl ++ "\n";
+}
 
 /// Parses arguments for a `pubkind` or `relkind` command group.
 /// `args` is the full argv slice; `cmd_index` is the index of the entity command
@@ -58,10 +114,16 @@ pub fn parseKindArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!Ki
     const sub_index = cmd_index + 1;
     if (args.len <= sub_index) return error.MissingSubcommand;
 
+    if (isHelpFlag(args[sub_index])) return error.HelpRequested;
+
     const sub = std.meta.stringToEnum(KindSubcommand, args[sub_index]) orelse
         return error.UnknownSubcommand;
 
     const rest = args[sub_index + 1 ..];
+
+    for (rest) |arg| {
+        if (isHelpFlag(arg)) return error.HelpRequested;
+    }
 
     switch (sub) {
         .show => {
@@ -167,6 +229,7 @@ pub fn formatKindError(
         error.InvalidNumber => try stderr.print("Invalid number in '{s}' command\n", .{lbl}),
         error.MissingUpdateField => try stderr.print("Update requires at least one of --name or --description\n", .{}),
         error.UnknownFlag => try stderr.print("Unknown flag in '{s}' command\n", .{lbl}),
+        error.HelpRequested => {},
     }
 }
 
@@ -271,4 +334,28 @@ test "unknown subcommand" {
     const args = mkArgs(&.{ "ken", "pubkind", "destroy" });
     const result = parseKindArgs(&args, 1);
     try testing.expectError(error.UnknownSubcommand, result);
+}
+
+test "help: --help at subcommand position" {
+    const args = mkArgs(&.{ "ken", "pubkind", "--help" });
+    const result = parseKindArgs(&args, 1);
+    try testing.expectError(error.HelpRequested, result);
+}
+
+test "help: -h at subcommand position" {
+    const args = mkArgs(&.{ "ken", "pubkind", "-h" });
+    const result = parseKindArgs(&args, 1);
+    try testing.expectError(error.HelpRequested, result);
+}
+
+test "help: --help within subcommand args" {
+    const args = mkArgs(&.{ "ken", "pubkind", "show", "--help" });
+    const result = parseKindArgs(&args, 1);
+    try testing.expectError(error.HelpRequested, result);
+}
+
+test "help: -h within list args" {
+    const args = mkArgs(&.{ "ken", "pubkind", "list", "-h" });
+    const result = parseKindArgs(&args, 1);
+    try testing.expectError(error.HelpRequested, result);
 }
