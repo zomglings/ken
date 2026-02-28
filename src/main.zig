@@ -8,6 +8,7 @@ const usage =
     \\Commands:
     \\  version    Print ken version
     \\  init       Create or upgrade a ken database
+    \\  initpath   Print default database path
     \\  dbversion  Print schema version of a ken database
     \\  add        Add a publication
     \\  note       Add or view notes
@@ -25,6 +26,7 @@ const usage =
 const Command = enum {
     version,
     init,
+    initpath,
     dbversion,
     add,
     note,
@@ -80,6 +82,20 @@ pub fn main(process: std.process.Init) !void {
                 return;
             }
             try stdout.print("{d}\n", .{ken.version});
+            try stdout.flush();
+        },
+        .initpath => {
+            if (hasHelpFlag(args[2..])) {
+                try stdout.print("Usage: ken initpath\n\nPrint the default database path for this platform.\n", .{});
+                try stdout.flush();
+                return;
+            }
+            const db_path = ken.defaultDbPath(arena) catch {
+                try stderr.print("Error: could not determine default database path\n", .{});
+                try stderr.flush();
+                return;
+            };
+            try stdout.print("{s}\n", .{db_path});
             try stdout.flush();
         },
         .init => {
