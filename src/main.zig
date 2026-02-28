@@ -133,11 +133,7 @@ pub fn main(process: std.process.Init) !void {
             try stdout.flush();
         },
         .init => {
-            const db_path: [:0]const u8 = explicit_db_path orelse (ken.defaultDbPath(arena) catch {
-                try stderr.print("Error: could not determine default database path\n", .{});
-                try stderr.flush();
-                return;
-            });
+            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
             if (explicit_db_path == null) {
                 if (std.fs.path.dirname(db_path)) |dir_path| {
                     Io.Dir.createDirAbsolute(process.io, dir_path, .default_dir) catch |err| switch (err) {
@@ -178,11 +174,7 @@ pub fn main(process: std.process.Init) !void {
             try stdout.flush();
         },
         .dbversion => {
-            const db_path: [:0]const u8 = explicit_db_path orelse (ken.defaultDbPath(arena) catch {
-                try stderr.print("Error: could not determine default database path\n", .{});
-                try stderr.flush();
-                return;
-            });
+            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
@@ -212,11 +204,7 @@ pub fn main(process: std.process.Init) !void {
                 return;
             };
 
-            const db_path: [:0]const u8 = explicit_db_path orelse (ken.defaultDbPath(arena) catch {
-                try stderr.print("Error: could not determine default database path\n", .{});
-                try stderr.flush();
-                return;
-            });
+            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
@@ -291,11 +279,7 @@ pub fn main(process: std.process.Init) !void {
                 return;
             };
 
-            const db_path: [:0]const u8 = explicit_db_path orelse (ken.defaultDbPath(arena) catch {
-                try stderr.print("Error: could not determine default database path\n", .{});
-                try stderr.flush();
-                return;
-            });
+            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
@@ -314,6 +298,14 @@ pub fn main(process: std.process.Init) !void {
             try stderr.flush();
         },
     }
+}
+
+fn resolveDbPath(explicit: ?[:0]const u8, alloc: std.mem.Allocator, stderr: anytype) ?[:0]const u8 {
+    return explicit orelse (ken.defaultDbPath(alloc) catch {
+        stderr.print("Error: could not determine default database path\n", .{}) catch {};
+        stderr.flush() catch {};
+        return null;
+    });
 }
 
 fn hasHelpFlag(args: []const [:0]const u8) bool {

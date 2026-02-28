@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 pub const db = @import("db.zig");
+const encodeJsonString = std.json.Stringify.encodeJsonString;
 
 pub const version: u32 = 0;
 pub const default_db_name = "ken.db";
@@ -243,28 +244,6 @@ pub const KindError = error{
     SqlFailed,
 };
 
-/// Write a JSON-escaped string (including surrounding quotes) to the writer.
-pub fn writeJsonString(writer: anytype, str: []const u8) !void {
-    try writer.writeAll("\"");
-    for (str) |c| {
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\t' => try writer.writeAll("\\t"),
-            '\r' => try writer.writeAll("\\r"),
-            0x08 => try writer.writeAll("\\b"),
-            0x0c => try writer.writeAll("\\f"),
-            0x00...0x07, 0x0b, 0x0e...0x1f => {
-                const hex = "0123456789abcdef";
-                try writer.writeAll(&[6]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] });
-            },
-            else => try writer.writeAll(&[1]u8{c}),
-        }
-    }
-    try writer.writeAll("\"");
-}
-
 /// Execute a pubkind/relkind action against the database.
 pub fn executeKindAction(
     database: *db.Db,
@@ -289,9 +268,9 @@ pub fn executeKindAction(
             defer if (desc) |d| allocator.free(d);
             if (desc) |d| {
                 stdout.writeAll("{\"name\":") catch return error.SqlFailed;
-                writeJsonString(stdout, v.name) catch return error.SqlFailed;
+                encodeJsonString(v.name, .{}, stdout) catch return error.SqlFailed;
                 stdout.writeAll(",\"description\":") catch return error.SqlFailed;
-                writeJsonString(stdout, d) catch return error.SqlFailed;
+                encodeJsonString(d, .{}, stdout) catch return error.SqlFailed;
                 stdout.writeAll("}\n") catch return error.SqlFailed;
             } else {
                 stderr.print("Error: {s} '{s}' not found\n", .{ lbl, v.name }) catch {};
@@ -313,10 +292,10 @@ pub fn executeKindAction(
             for (rows, 0..) |row, idx| {
                 if (idx > 0) stdout.writeAll(",") catch return error.SqlFailed;
                 stdout.writeAll("{\"name\":") catch return error.SqlFailed;
-                writeJsonString(stdout, row[0]) catch return error.SqlFailed;
+                encodeJsonString(row[0], .{}, stdout) catch return error.SqlFailed;
                 if (v.descriptions) {
                     stdout.writeAll(",\"description\":") catch return error.SqlFailed;
-                    writeJsonString(stdout, row[1]) catch return error.SqlFailed;
+                    encodeJsonString(row[1], .{}, stdout) catch return error.SqlFailed;
                 }
                 stdout.writeAll("}") catch return error.SqlFailed;
             }
@@ -337,9 +316,9 @@ pub fn executeKindAction(
                 return error.SqlFailed;
             };
             stdout.writeAll("{\"name\":") catch return error.SqlFailed;
-            writeJsonString(stdout, v.name) catch return error.SqlFailed;
+            encodeJsonString(v.name, .{}, stdout) catch return error.SqlFailed;
             stdout.writeAll(",\"description\":") catch return error.SqlFailed;
-            writeJsonString(stdout, v.description) catch return error.SqlFailed;
+            encodeJsonString(v.description, .{}, stdout) catch return error.SqlFailed;
             stdout.writeAll("}\n") catch return error.SqlFailed;
         },
         .remove => |v| {
@@ -361,7 +340,7 @@ pub fn executeKindAction(
                 return error.NotFound;
             }
             stdout.writeAll("{\"name\":") catch return error.SqlFailed;
-            writeJsonString(stdout, v.name) catch return error.SqlFailed;
+            encodeJsonString(v.name, .{}, stdout) catch return error.SqlFailed;
             stdout.writeAll(",\"removed\":true}\n") catch return error.SqlFailed;
         },
         .update => |v| {
@@ -419,7 +398,7 @@ pub fn executeKindAction(
             }
             const final_name = v.new_name orelse v.name;
             stdout.writeAll("{\"name\":") catch return error.SqlFailed;
-            writeJsonString(stdout, final_name) catch return error.SqlFailed;
+            encodeJsonString(final_name, .{}, stdout) catch return error.SqlFailed;
             stdout.writeAll(",\"updated\":true}\n") catch return error.SqlFailed;
         },
     }
@@ -955,25 +934,4 @@ test "executeKindAction: list with --descriptions" {
     const output = out.buffered();
     try testing.expect(std.mem.indexOf(u8, output, "\"description\":") != null);
     try testing.expect(std.mem.indexOf(u8, output, "\"name\":\"arxiv\"") != null);
-}
-
-test "writeJsonString: plain text" {
-    var buf: [256]u8 = undefined;
-    var out: std.Io.Writer = .fixed(&buf);
-    try writeJsonString(&out, "hello");
-    try testing.expectEqualStrings("\"hello\"", out.buffered());
-}
-
-test "writeJsonString: escapes quotes and backslashes" {
-    var buf: [256]u8 = undefined;
-    var out: std.Io.Writer = .fixed(&buf);
-    try writeJsonString(&out, "say \"hi\" \\ there");
-    try testing.expectEqualStrings("\"say \\\"hi\\\" \\\\ there\"", out.buffered());
-}
-
-test "writeJsonString: escapes newlines and tabs" {
-    var buf: [256]u8 = undefined;
-    var out: std.Io.Writer = .fixed(&buf);
-    try writeJsonString(&out, "line1\nline2\tend");
-    try testing.expectEqualStrings("\"line1\\nline2\\tend\"", out.buffered());
 }
