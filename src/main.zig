@@ -1,4 +1,5 @@
 const std = @import("std");
+const ken = @import("ken");
 const Io = std.Io;
 
 const usage =
@@ -13,6 +14,8 @@ const usage =
     \\  search   Search publications
     \\  merge    Merge two ken databases
     \\  skill    Generate agent skills
+    \\  pubkind  Manage publication kinds
+    \\  relkind  Manage relationship kinds
     \\  help     Show this help message
     \\
 ;
@@ -26,6 +29,8 @@ const Command = enum {
     search,
     merge,
     skill,
+    pubkind,
+    relkind,
     help,
 };
 
@@ -58,9 +63,26 @@ pub fn main(process: std.process.Init) !void {
             try stdout.print(usage, .{});
             try stdout.flush();
         },
+        .pubkind => try handleKind(.pubkind, args, stdout, stderr),
+        .relkind => try handleKind(.relkind, args, stdout, stderr),
         inline else => |tag| {
             try stderr.print("{s}: not yet implemented\n", .{@tagName(tag)});
             try stderr.flush();
         },
     }
+}
+
+fn handleKind(
+    entity: ken.KindEntity,
+    args: []const [:0]const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !void {
+    const action = ken.parseKindArgs(args, 1) catch |err| {
+        try ken.formatKindError(entity, err, stderr);
+        try stderr.flush();
+        return;
+    };
+    try ken.executeKindAction(entity, action, stdout);
+    try stdout.flush();
 }
