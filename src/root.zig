@@ -681,14 +681,15 @@ pub fn formatKindError(
 // ── Merge ──
 
 pub const mergeUsage =
-    \\Usage: ken [-D <path>] merge <source-path> [--check] [--nocheck] [--force]
+    \\Usage: ken [-D <path>] merge -f <source-path> [--check] [--nocheck] [--force]
     \\
     \\Merge a source ken database into the target database.
     \\Data flows from source into the target (opened via -D or default path).
     \\The entire merge runs in a single transaction for atomicity.
     \\
     \\Options:
-    \\  -D, --db <path>  Path to target ken database (default: platform-specific)
+    \\  -D, --db <path>       Path to target ken database (default: platform-specific)
+    \\  -f, --from <path>     Path to source ken database (required)
     \\
     \\Flags:
     \\  --check    Only check for kind conflicts, don't merge.
@@ -733,7 +734,7 @@ const MergeCounts = struct {
     notes: i32 = 0,
 };
 
-/// Parse arguments for `ken merge <source-path> [--check|--nocheck|--force]`.
+/// Parse arguments for `ken merge -f <source-path> [--check|--nocheck|--force]`.
 /// `args` is full argv; `cmd_index` is the index of "merge".
 pub fn parseMergeArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!MergeAction {
     const rest = args[cmd_index + 1 ..];
@@ -743,10 +744,16 @@ pub fn parseMergeArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!M
     var have_source = false;
     var mode_count: u32 = 0;
 
-    for (rest) |arg| {
-        const a: []const u8 = arg;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a: []const u8 = rest[i];
         if (isHelpFlag(a)) return error.HelpRequested;
-        if (std.mem.eql(u8, a, "--check")) {
+        if (std.mem.eql(u8, a, "-f") or std.mem.eql(u8, a, "--from")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingArgument;
+            result.source_path = rest[i];
+            have_source = true;
+        } else if (std.mem.eql(u8, a, "--check")) {
             result.mode = .check;
             mode_count += 1;
         } else if (std.mem.eql(u8, a, "--nocheck")) {
@@ -755,12 +762,8 @@ pub fn parseMergeArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!M
         } else if (std.mem.eql(u8, a, "--force")) {
             result.mode = .force;
             mode_count += 1;
-        } else if (a.len > 0 and a[0] == '-') {
-            return error.UnknownFlag;
         } else {
-            if (have_source) return error.UnknownFlag; // extra positional
-            result.source_path = a;
-            have_source = true;
+            return error.UnknownFlag;
         }
     }
 
@@ -1370,36 +1373,49 @@ test "executeKindAction: list with --descriptions" {
 
 // ── parseMergeArgs tests ──
 
-test "merge: source path only" {
-    const args = mkArgs(&.{ "ken", "merge", "source.db" });
+test "merge: -f source path" {
+    const args = mkArgs(&.{ "ken", "merge", "-f", "source.db" });
+    const action = try parseMergeArgs(&args, 1);
+    try testing.expectEqualStrings("source.db", action.source_path);
+    try testing.expect(action.mode == .default);
+}
+
+test "merge: --from source path" {
+    const args = mkArgs(&.{ "ken", "merge", "--from", "source.db" });
     const action = try parseMergeArgs(&args, 1);
     try testing.expectEqualStrings("source.db", action.source_path);
     try testing.expect(action.mode == .default);
 }
 
 test "merge: --check flag" {
-    const args = mkArgs(&.{ "ken", "merge", "source.db", "--check" });
+    const args = mkArgs(&.{ "ken", "merge", "-f", "source.db", "--check" });
     const action = try parseMergeArgs(&args, 1);
     try testing.expectEqualStrings("source.db", action.source_path);
     try testing.expect(action.mode == .check);
 }
 
 test "merge: --nocheck flag" {
-    const args = mkArgs(&.{ "ken", "merge", "--nocheck", "source.db" });
+    const args = mkArgs(&.{ "ken", "merge", "--nocheck", "-f", "source.db" });
     const action = try parseMergeArgs(&args, 1);
     try testing.expectEqualStrings("source.db", action.source_path);
     try testing.expect(action.mode == .nocheck);
 }
 
 test "merge: --force flag" {
-    const args = mkArgs(&.{ "ken", "merge", "source.db", "--force" });
+    const args = mkArgs(&.{ "ken", "merge", "-f", "source.db", "--force" });
     const action = try parseMergeArgs(&args, 1);
     try testing.expectEqualStrings("source.db", action.source_path);
     try testing.expect(action.mode == .force);
 }
 
-test "merge: missing source path" {
+test "merge: missing -f flag" {
     const args = mkArgs(&.{ "ken", "merge" });
+    const result = parseMergeArgs(&args, 1);
+    try testing.expectError(error.MissingArgument, result);
+}
+
+test "merge: -f without value" {
+    const args = mkArgs(&.{ "ken", "merge", "-f" });
     const result = parseMergeArgs(&args, 1);
     try testing.expectError(error.MissingArgument, result);
 }
@@ -1411,24 +1427,24 @@ test "merge: help flag" {
 }
 
 test "merge: help flag with source" {
-    const args = mkArgs(&.{ "ken", "merge", "source.db", "--help" });
+    const args = mkArgs(&.{ "ken", "merge", "-f", "source.db", "--help" });
     const result = parseMergeArgs(&args, 1);
     try testing.expectError(error.HelpRequested, result);
 }
 
 test "merge: unknown flag" {
-    const args = mkArgs(&.{ "ken", "merge", "source.db", "--bogus" });
+    const args = mkArgs(&.{ "ken", "merge", "-f", "source.db", "--bogus" });
     const result = parseMergeArgs(&args, 1);
     try testing.expectError(error.UnknownFlag, result);
 }
 
 test "merge: multiple mode flags rejected" {
-    const args = mkArgs(&.{ "ken", "merge", "source.db", "--check", "--force" });
+    const args = mkArgs(&.{ "ken", "merge", "-f", "source.db", "--check", "--force" });
     const result = parseMergeArgs(&args, 1);
     try testing.expectError(error.UnknownFlag, result);
 }
 
-test "merge: flag-only (no source)" {
+test "merge: mode flag without source" {
     const args = mkArgs(&.{ "ken", "merge", "--check" });
     const result = parseMergeArgs(&args, 1);
     try testing.expectError(error.MissingArgument, result);

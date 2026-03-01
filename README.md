@@ -115,8 +115,11 @@ to target a specific database. If omitted, the default platform-specific path is
 a single SQLite transaction for atomicity.
 
 ```
-ken [-D <path>] merge <source-path> [--check] [--nocheck] [--force]
+ken [-D <path>] merge -f <source-path> [--check] [--nocheck] [--force]
 ```
+
+Options:
+- `-f/--from <path>`: path to the source ken database (required).
 
 Flags:
 - No flag (default): check for kind conflicts first; abort if any are found, merge otherwise.
@@ -140,16 +143,16 @@ Example workflows:
 
 ```sh
 # Basic merge
-ken -D target.db merge source.db
+ken -D target.db merge -f source.db
 
 # Check for conflicts before merging
-ken -D target.db merge --check source.db
+ken -D target.db merge -f source.db --check
 
 # Force merge (target descriptions win on conflicts)
-ken -D target.db merge --force source.db
+ken -D target.db merge -f source.db --force
 
 # Skip all checks (fastest, target wins on collisions)
-ken -D target.db merge --nocheck source.db
+ken -D target.db merge -f source.db --nocheck
 ```
 
 On success, merge outputs a JSON object with insertion counts:

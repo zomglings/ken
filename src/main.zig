@@ -409,8 +409,8 @@ pub fn main(process: std.process.Init) !void {
                     return;
                 }
                 switch (err) {
-                    error.MissingArgument => try stderr.print("Error: missing source path. Usage: ken merge <source-path> [--check|--nocheck|--force]\n", .{}),
-                    error.UnknownFlag => try stderr.print("Error: unknown or conflicting flag. Usage: ken merge <source-path> [--check|--nocheck|--force]\n", .{}),
+                    error.MissingArgument => try stderr.print("Error: missing -f/--from <source>. Usage: ken merge -f <source-path> [--check|--nocheck|--force]\n", .{}),
+                    error.UnknownFlag => try stderr.print("Error: unknown or conflicting flag. Usage: ken merge -f <source-path> [--check|--nocheck|--force]\n", .{}),
                     else => try stderr.print("Error: invalid arguments for 'merge'\n", .{}),
                 }
                 try stderr.flush();
