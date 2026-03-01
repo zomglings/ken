@@ -512,6 +512,164 @@ pub fn uuidV4(buf: *[36]u8, rand_bytes: *[16]u8) void {
     }
 }
 
+pub const listUsage =
+    \\Usage: ken [-D <path>] list [--kind <kind>] [--limit N] [--offset N]
+    \\
+    \\List publications as a JSON array.
+    \\
+    \\Options:
+    \\  -D, --db <path>  Path to ken database (default: platform-specific)
+    \\  --kind <kind>    Filter by publication kind
+    \\  --limit N        Maximum number of results
+    \\  --offset N       Skip first N results
+    \\
+;
+
+pub const ListAction = struct {
+    kind: ?[]const u8 = null,
+    pagination: Pagination = .{},
+};
+
+/// Parse arguments for `ken list [--kind <kind>] [--limit N] [--offset N]`.
+/// `args` is full argv; `cmd_index` is the index of "list".
+pub fn parseListArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!ListAction {
+    const rest = args[cmd_index + 1 ..];
+    var result = ListAction{};
+
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const arg: []const u8 = rest[i];
+        if (isHelpFlag(arg)) return error.HelpRequested;
+        if (std.mem.eql(u8, arg, "--kind")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingArgument;
+            result.kind = rest[i];
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingArgument;
+            result.pagination.limit = std.fmt.parseInt(u32, rest[i], 10) catch
+                return error.InvalidNumber;
+        } else if (std.mem.eql(u8, arg, "--offset")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingArgument;
+            result.pagination.offset = std.fmt.parseInt(u32, rest[i], 10) catch
+                return error.InvalidNumber;
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+
+    return result;
+}
+
+pub const ListError = error{
+    SqlFailed,
+};
+
+/// Execute the list action: query publications, write JSON array to stdout.
+pub fn executeListAction(
+    database: *db.Db,
+    allocator: std.mem.Allocator,
+    action: ListAction,
+    stdout: anytype,
+) ListError!void {
+    const lim: i64 = if (action.pagination.limit) |l| @intCast(l) else -1;
+    const off: u32 = action.pagination.offset orelse 0;
+
+    if (action.kind) |kind| {
+        var sql_buf: [256]u8 = undefined;
+        const sql = std.fmt.bufPrintZ(
+            &sql_buf,
+            "SELECT id, kind, title, key FROM publications WHERE kind = ?1 ORDER BY created_at DESC LIMIT {d} OFFSET {d};",
+            .{ lim, off },
+        ) catch unreachable;
+        const rows = database.queryRows4(allocator, sql, &.{kind}) catch return error.SqlFailed;
+        defer db.Db.freeRows4(allocator, rows);
+        writePublicationRows(rows, stdout) catch return error.SqlFailed;
+    } else {
+        var sql_buf: [256]u8 = undefined;
+        const sql = std.fmt.bufPrintZ(
+            &sql_buf,
+            "SELECT id, kind, title, key FROM publications ORDER BY created_at DESC LIMIT {d} OFFSET {d};",
+            .{ lim, off },
+        ) catch unreachable;
+        const rows = database.queryRows4(allocator, sql, &.{}) catch return error.SqlFailed;
+        defer db.Db.freeRows4(allocator, rows);
+        writePublicationRows(rows, stdout) catch return error.SqlFailed;
+    }
+}
+
+fn writePublicationRows(rows: [][4][]const u8, stdout: anytype) !void {
+    try stdout.writeAll("[");
+    for (rows, 0..) |row, idx| {
+        if (idx > 0) try stdout.writeAll(",");
+        try stdout.writeAll("{\"id\":");
+        try encodeJsonString(row[0], .{}, stdout);
+        try stdout.writeAll(",\"kind\":");
+        try encodeJsonString(row[1], .{}, stdout);
+        try stdout.writeAll(",\"title\":");
+        try encodeJsonString(row[2], .{}, stdout);
+        try stdout.writeAll(",\"key\":");
+        try encodeJsonString(row[3], .{}, stdout);
+        try stdout.writeAll("}");
+    }
+    try stdout.writeAll("]\n");
+}
+
+pub const relateUsage =
+    \\Usage: ken [-D <path>] relate -s <subject-id> -o <object-id> -r <kind>
+    \\
+    \\Create a relationship between two publications.
+    \\
+    \\Options:
+    \\  -D, --db <path>       Path to ken database (default: platform-specific)
+    \\  -s, --subject <id>    Subject publication UUID
+    \\  -o, --object <id>     Object publication UUID
+    \\  -r, --relation <kind> Relationship kind name
+    \\
+;
+
+pub const RelateAction = struct {
+    subject: []const u8,
+    object: []const u8,
+    kind: []const u8,
+};
+
+/// Parse arguments for `ken relate -s <id> -o <id> -r <kind>`.
+/// `args` is full argv; `cmd_index` is the index of "relate".
+pub fn parseRelateArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!RelateAction {
+    const rest = args[cmd_index + 1 ..];
+    if (rest.len == 0) return error.MissingArgument;
+
+    var subject: ?[]const u8 = null;
+    var object: ?[]const u8 = null;
+    var kind: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const arg: []const u8 = rest[i];
+        if (isHelpFlag(arg)) return error.HelpRequested;
+        if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--subject")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingArgument;
+            subject = rest[i];
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--object")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingArgument;
+            object = rest[i];
+        } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--relation")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingArgument;
+            kind = rest[i];
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+
+    if (subject == null or object == null or kind == null) return error.MissingArgument;
+    return .{ .subject = subject.?, .object = object.?, .kind = kind.? };
+}
+
 /// Format a ParseError for display.
 pub fn formatKindError(
     entity: KindEntity,

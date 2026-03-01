@@ -48,6 +48,8 @@ fn printCommandUsage(cmd: Command, stdout: anytype) !void {
         .initpath => try stdout.writeAll("Usage: ken initpath\n\nPrint the default database path for this platform.\n"),
         .dbversion => try stdout.writeAll("Usage: ken [-D <path>] dbversion\n\nPrint schema version of a ken database.\nIf -D is not given, uses the default location.\n"),
         .add => try stdout.writeAll(ken.addUsage),
+        .relate => try stdout.writeAll(ken.relateUsage),
+        .list => try stdout.writeAll(ken.listUsage),
         .pubkind => try stdout.writeAll(ken.kindUsage(.pubkind)),
         .relkind => try stdout.writeAll(ken.kindUsage(.relkind)),
         .help => try stdout.writeAll(usage),
@@ -112,7 +114,7 @@ pub fn main(process: std.process.Init) !void {
     // own parsers (add) handle -h internally so help is scoped to the
     // specific subcommand being asked about.
     switch (cmd) {
-        .pubkind, .relkind, .add => {},
+        .pubkind, .relkind, .add, .relate, .list => {},
         else => {
             if (hasHelpFlag(args[2..])) {
                 try printCommandUsage(cmd, stdout);
@@ -282,6 +284,122 @@ pub fn main(process: std.process.Init) !void {
             }
 
             try stdout.print("{s}\n", .{&uuid});
+            try stdout.flush();
+        },
+        .relate => {
+            const action = ken.parseRelateArgs(args, 1) catch |err| {
+                if (err == error.HelpRequested) {
+                    try stdout.writeAll(ken.relateUsage);
+                    try stdout.flush();
+                    return;
+                }
+                switch (err) {
+                    error.MissingArgument => try stderr.print("Error: missing argument. Usage: ken relate -s <id> -o <id> -r <kind>\n", .{}),
+                    error.UnknownFlag => try stderr.print("Error: unknown flag. Usage: ken relate -s <id> -o <id> -r <kind>\n", .{}),
+                    else => try stderr.print("Error: invalid arguments for 'relate'\n", .{}),
+                }
+                try stderr.flush();
+                return;
+            };
+
+            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
+            var database = ken.db.Db.open(db_path) catch {
+                try stderr.print("Error: could not open database '{s}'\n", .{db_path});
+                try stderr.flush();
+                return;
+            };
+            defer database.close();
+
+            // Validate subject exists
+            const subject_exists = database.exists(
+                "SELECT 1 FROM publications WHERE id = ?1;",
+                &.{action.subject},
+            ) catch {
+                try stderr.print("Error: could not query database\n", .{});
+                try stderr.flush();
+                return;
+            };
+            if (!subject_exists) {
+                try stderr.print("Error: subject publication '{s}' not found\n", .{action.subject});
+                try stderr.flush();
+                return;
+            }
+
+            // Validate object exists
+            const object_exists = database.exists(
+                "SELECT 1 FROM publications WHERE id = ?1;",
+                &.{action.object},
+            ) catch {
+                try stderr.print("Error: could not query database\n", .{});
+                try stderr.flush();
+                return;
+            };
+            if (!object_exists) {
+                try stderr.print("Error: object publication '{s}' not found\n", .{action.object});
+                try stderr.flush();
+                return;
+            }
+
+            // Validate relationship kind exists
+            const kind_exists = database.exists(
+                "SELECT 1 FROM relationship_kinds WHERE name = ?1;",
+                &.{action.kind},
+            ) catch {
+                try stderr.print("Error: could not query database\n", .{});
+                try stderr.flush();
+                return;
+            };
+            if (!kind_exists) {
+                try stderr.print("Error: unknown relationship kind '{s}'\n", .{action.kind});
+                try stderr.flush();
+                return;
+            }
+
+            // Generate UUID and insert relationship
+            const uuid = genUuid(process.io);
+
+            database.execParams(
+                "INSERT INTO relationships (id, subject, object, kind) VALUES (?1, ?2, ?3, ?4);",
+                &.{ &uuid, action.subject, action.object, action.kind },
+            ) catch {
+                try stderr.print("Error: could not insert relationship\n", .{});
+                try stderr.flush();
+                return;
+            };
+
+            try stdout.print("{s}\n", .{&uuid});
+            try stdout.flush();
+        },
+        .list => {
+            const action = ken.parseListArgs(args, 1) catch |err| {
+                if (err == error.HelpRequested) {
+                    try stdout.writeAll(ken.listUsage);
+                    try stdout.flush();
+                    return;
+                }
+                switch (err) {
+                    error.MissingArgument => try stderr.print("Error: missing argument for 'list' flag\n", .{}),
+                    error.InvalidNumber => try stderr.print("Error: invalid number in 'list' command\n", .{}),
+                    error.UnknownFlag => try stderr.print("Error: unknown flag in 'list' command\n", .{}),
+                    else => try stderr.print("Error: invalid arguments for 'list'\n", .{}),
+                }
+                try stderr.flush();
+                return;
+            };
+
+            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
+            var database = ken.db.Db.open(db_path) catch {
+                try stderr.print("Error: could not open database '{s}'\n", .{db_path});
+                try stderr.flush();
+                return;
+            };
+            defer database.close();
+
+            ken.executeListAction(&database, arena, action, stdout) catch {
+                try stderr.print("Error: could not list publications\n", .{});
+                try stderr.flush();
+                return;
+            };
             try stdout.flush();
         },
         inline .pubkind, .relkind => |tag| {

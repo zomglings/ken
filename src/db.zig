@@ -177,6 +177,50 @@ pub const Db = struct {
         allocator.free(rows);
     }
 
+    /// Query all rows returning four text columns. Returns [][4][]const u8.
+    /// Caller must call freeRows4 to release memory.
+    pub fn queryRows4(self: *Db, allocator: std.mem.Allocator, sql: [*:0]const u8, params: []const ?[]const u8) (SqliteError || error{OutOfMemory})![][4][]const u8 {
+        const stmt = try self.prepareAndBind(sql, params);
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var rows: std.ArrayList([4][]const u8) = .empty;
+        errdefer {
+            for (rows.items) |row| {
+                for (row) |col| allocator.free(col);
+            }
+            rows.deinit(allocator);
+        }
+
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+            var row: [4][]const u8 = undefined;
+            var ok: usize = 0;
+            errdefer for (row[0..ok]) |col| allocator.free(col);
+
+            inline for (0..4) |col_i| {
+                const ptr = c.sqlite3_column_text(stmt, col_i);
+                const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col_i));
+                row[col_i] = if (ptr != null) try allocator.dupe(u8, ptr[0..len]) else try allocator.dupe(u8, "");
+                ok += 1;
+            }
+
+            try rows.append(allocator, row);
+        }
+
+        return rows.toOwnedSlice(allocator);
+    }
+
+    /// Free rows returned by queryRows4.
+    pub fn freeRows4(allocator: std.mem.Allocator, rows: [][4][]const u8) void {
+        for (rows) |row| {
+            for (row) |col| allocator.free(col);
+        }
+        allocator.free(rows);
+    }
+
     /// Returns the current schema version, or null if _ken_meta doesn't exist.
     pub fn getVersion(self: *Db) SqliteError!?u32 {
         const has_meta = try self.queryInt(
