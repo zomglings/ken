@@ -1,0 +1,76 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate tag format
+        run: echo "${GITHUB_REF_NAME}" | grep -qE '^v[0-9]+$'
+
+      - name: Validate version sequence
+        run: |
+          EXPECTED=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName \
+            --jq '[.[].tagName | select(test("^v[0-9]+$")) | ltrimstr("v") | tonumber]
+                  | if length == 0 then 0 else (max + 1) end')
+          ACTUAL=$(echo "${GITHUB_REF_NAME}" | sed 's/^v//')
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "Tag ${GITHUB_REF_NAME} is not sequential. Expected v${EXPECTED}."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0-dev.2676+4e2cec265
+
+      - name: Run tests
+        run: zig build test --summary all
+
+      - name: Build x86_64-linux
+        run: |
+          zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
+          cp zig-out/bin/ken ken-x86_64-linux
+
+      - name: Verify ken version matches tag
+        run: |
+          TAG_VERSION=$(echo "${GITHUB_REF_NAME}" | sed 's/^v//')
+          KEN_VERSION=$(./ken-x86_64-linux version)
+          if [ "$KEN_VERSION" != "$TAG_VERSION" ]; then
+            echo "Version mismatch: ken reports ${KEN_VERSION}, tag is v${TAG_VERSION}"
+            exit 1
+          fi
+
+      - name: Build aarch64-linux
+        run: |
+          zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe
+          cp zig-out/bin/ken ken-aarch64-linux
+
+      - name: Build x86_64-macos
+        run: |
+          zig build -Dtarget=x86_64-macos -Doptimize=ReleaseSafe
+          cp zig-out/bin/ken ken-x86_64-macos
+
+      - name: Build aarch64-macos
+        run: |
+          zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe
+          cp zig-out/bin/ken ken-aarch64-macos
+
+      - name: Create release
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            ken-x86_64-linux \
+            ken-aarch64-linux \
+            ken-x86_64-macos \
+            ken-aarch64-macos
