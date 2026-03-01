@@ -69,6 +69,7 @@ jobs:
       - name: Create release
         run: |
           gh release create "${GITHUB_REF_NAME}" \
+            --draft \
             --generate-notes \
             ken-x86_64-linux \
             ken-aarch64-linux \
