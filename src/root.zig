@@ -8,6 +8,16 @@ const encodeJsonString = std.json.Stringify.encodeJsonString;
 pub const version: u32 = 0;
 pub const default_db_name = "ken.db";
 
+/// Human-readable default database path for help text, resolved at comptime.
+pub const default_db_path_hint: []const u8 = switch (builtin.os.tag) {
+    .macos => "~/Library/Application Support/ken/" ++ default_db_name,
+    .linux => "~/.local/share/ken/" ++ default_db_name,
+    .windows => "%LOCALAPPDATA%\\ken\\" ++ default_db_name,
+    else => "~/.ken/" ++ default_db_name,
+};
+
+pub const db_flag_help = "  -D, --db <path>  Path to ken database (default: " ++ default_db_path_hint ++ ")\n";
+
 /// Returns the default database path, platform-appropriate:
 /// - macOS: ~/Library/Application Support/ken/ken.db
 /// - Linux: $XDG_DATA_HOME/ken/ken.db or ~/.local/share/ken/ken.db
@@ -145,7 +155,7 @@ pub fn kindUsage(comptime entity: KindEntity) []const u8 {
     return "Usage: ken [-D <path>] " ++ @tagName(entity) ++ " <subcommand> [options]\n" ++
         "\nManage " ++ lbl ++ "s.\n" ++
         "\nOptions:\n" ++
-        "  -D, --db <path>  Path to ken database (default: platform-specific)\n" ++
+        db_flag_help ++
         "\nSubcommands:\n" ++
         "  show <name>                                Show a " ++ lbl ++ "\n" ++
         "  list [--limit N] [--offset N] [--descriptions] List " ++ lbl ++ "s\n" ++
@@ -158,11 +168,11 @@ pub fn kindSubcommandUsage(comptime entity: KindEntity, comptime sub: KindSubcom
     const ent = @tagName(entity);
     const lbl = entity.label();
     return switch (sub) {
-        .show => "Usage: ken [-D <path>] " ++ ent ++ " show <name>\n\nShow a " ++ lbl ++ " by name. Prints JSON with name and description.\n\nOptions:\n  -D, --db <path>  Path to ken database (default: platform-specific)\n",
-        .list => "Usage: ken [-D <path>] " ++ ent ++ " list [--limit N] [--offset N] [--descriptions]\n\nList " ++ lbl ++ "s as a JSON array.\n\nOptions:\n  -D, --db <path>  Path to ken database (default: platform-specific)\n  --limit N        Maximum number of results\n  --offset N       Skip first N results\n  --descriptions   Include descriptions in output\n",
-        .add => "Usage: ken [-D <path>] " ++ ent ++ " add <name> <description>\n\nAdd a new " ++ lbl ++ ".\n\nOptions:\n  -D, --db <path>  Path to ken database (default: platform-specific)\n",
-        .remove => "Usage: ken [-D <path>] " ++ ent ++ " remove <name>\n\nRemove a " ++ lbl ++ ". Fails if the kind is in use.\n\nOptions:\n  -D, --db <path>  Path to ken database (default: platform-specific)\n",
-        .update => "Usage: ken [-D <path>] " ++ ent ++ " update <name> [--name N] [--description D]\n\nUpdate a " ++ lbl ++ ". At least one of --name or --description is required.\n\nOptions:\n  -D, --db <path>  Path to ken database (default: platform-specific)\n",
+        .show => "Usage: ken [-D <path>] " ++ ent ++ " show <name>\n\nShow a " ++ lbl ++ " by name. Prints JSON with name and description.\n\nOptions:\n" ++ db_flag_help,
+        .list => "Usage: ken [-D <path>] " ++ ent ++ " list [--limit N] [--offset N] [--descriptions]\n\nList " ++ lbl ++ "s as a JSON array.\n\nOptions:\n" ++ db_flag_help ++ "  --limit N        Maximum number of results\n  --offset N       Skip first N results\n  --descriptions   Include descriptions in output\n",
+        .add => "Usage: ken [-D <path>] " ++ ent ++ " add <name> <description>\n\nAdd a new " ++ lbl ++ ".\n\nOptions:\n" ++ db_flag_help,
+        .remove => "Usage: ken [-D <path>] " ++ ent ++ " remove <name>\n\nRemove a " ++ lbl ++ ". Fails if the kind is in use.\n\nOptions:\n" ++ db_flag_help,
+        .update => "Usage: ken [-D <path>] " ++ ent ++ " update <name> [--name N] [--description D]\n\nUpdate a " ++ lbl ++ ". At least one of --name or --description is required.\n\nOptions:\n" ++ db_flag_help,
     };
 }
 
@@ -441,7 +451,8 @@ pub const addUsage =
     \\Add a publication to the database.
     \\
     \\Options:
-    \\  -D, --db <path>  Path to ken database (default: platform-specific)
+    \\
+++ db_flag_help ++
     \\
     \\Arguments:
     \\  <kind>           Publication kind (e.g. note, arxiv, video, web)
@@ -518,7 +529,8 @@ pub const listUsage =
     \\List publications as a JSON array.
     \\
     \\Options:
-    \\  -D, --db <path>  Path to ken database (default: platform-specific)
+    \\
+++ db_flag_help ++
     \\  --kind <kind>    Filter by publication kind
     \\  --limit N        Maximum number of results
     \\  --offset N       Skip first N results
@@ -612,7 +624,8 @@ pub const relateUsage =
     \\Create a relationship between two publications.
     \\
     \\Options:
-    \\  -D, --db <path>       Path to ken database (default: platform-specific)
+    \\
+++ db_flag_help ++
     \\  -s, --subject <id>    Subject publication UUID
     \\  -o, --object <id>     Object publication UUID
     \\  -r, --relation <kind> Relationship kind name
@@ -688,7 +701,8 @@ pub const mergeUsage =
     \\The entire merge runs in a single transaction for atomicity.
     \\
     \\Options:
-    \\  -D, --db <path>       Path to target ken database (default: platform-specific)
+    \\
+++ db_flag_help ++
     \\  -f, --from <path>     Path to source ken database (required)
     \\
     \\Flags:

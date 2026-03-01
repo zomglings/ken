@@ -6,7 +6,8 @@ const usage =
     \\Usage: ken [-D <path>] <command> [options]
     \\
     \\Options:
-    \\  -D, --db <path>  Path to ken database (default: platform-specific)
+    \\
+++ ken.db_flag_help ++
     \\
     \\Commands:
     \\  version    Print ken version
