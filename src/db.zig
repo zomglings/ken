@@ -449,3 +449,76 @@ test "queryRows: empty result" {
 
     try testing.expectEqual(@as(usize, 0), rows.len);
 }
+
+test "queryRows: 4 columns" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+
+    _ = try db.migrate(toy_migrations);
+
+    try db.execParams("INSERT INTO items (id, name, description) VALUES (?1, ?2, ?3);", &.{ "1", "alpha", "first" });
+    try db.execParams("INSERT INTO tags (id, item_id, tag) VALUES (?1, ?2, ?3);", &.{ "10", "1", "cool" });
+    try db.execParams("INSERT INTO items (id, name, description) VALUES (?1, ?2, ?3);", &.{ "2", "beta", "second" });
+    try db.execParams("INSERT INTO tags (id, item_id, tag) VALUES (?1, ?2, ?3);", &.{ "20", "2", "neat" });
+
+    const rows = try db.queryRows(
+        4,
+        testing.allocator,
+        "SELECT i.id, i.name, i.description, t.tag FROM items i JOIN tags t ON t.item_id = i.id ORDER BY i.name;",
+        &.{},
+    );
+    defer Db.freeRows(4, testing.allocator, rows);
+
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("1", rows[0][0]);
+    try testing.expectEqualStrings("alpha", rows[0][1]);
+    try testing.expectEqualStrings("first", rows[0][2]);
+    try testing.expectEqualStrings("cool", rows[0][3]);
+    try testing.expectEqualStrings("2", rows[1][0]);
+    try testing.expectEqualStrings("beta", rows[1][1]);
+    try testing.expectEqualStrings("second", rows[1][2]);
+    try testing.expectEqualStrings("neat", rows[1][3]);
+}
+
+test "queryRows: 1 column" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+
+    _ = try db.migrate(toy_migrations);
+
+    try db.execParams("INSERT INTO items (name) VALUES (?1);", &.{"alpha"});
+    try db.execParams("INSERT INTO items (name) VALUES (?1);", &.{"beta"});
+
+    const rows = try db.queryRows(
+        1,
+        testing.allocator,
+        "SELECT name FROM items ORDER BY name;",
+        &.{},
+    );
+    defer Db.freeRows(1, testing.allocator, rows);
+
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("alpha", rows[0][0]);
+    try testing.expectEqualStrings("beta", rows[1][0]);
+}
+
+test "queryRows: null columns become empty strings" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+
+    _ = try db.migrate(toy_migrations);
+
+    try db.execParams("INSERT INTO items (name, description) VALUES (?1, ?2);", &.{ "no-desc", null });
+
+    const rows = try db.queryRows(
+        2,
+        testing.allocator,
+        "SELECT name, description FROM items;",
+        &.{},
+    );
+    defer Db.freeRows(2, testing.allocator, rows);
+
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("no-desc", rows[0][0]);
+    try testing.expectEqualStrings("", rows[0][1]);
+}
