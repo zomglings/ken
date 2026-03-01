@@ -19,9 +19,13 @@ jobs:
 
       - name: Validate version sequence
         run: |
-          EXPECTED=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName \
-            --jq '[.[].tagName | select(test("^v[0-9]+$")) | ltrimstr("v") | tonumber]
-                  | if length == 0 then 0 else (max + 1) end')
+          LATEST=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName \
+            --jq '.[0].tagName // empty')
+          if [ -z "$LATEST" ]; then
+            EXPECTED=0
+          else
+            EXPECTED=$(( ${LATEST#v} + 1 ))
+          fi
           ACTUAL=$(echo "${GITHUB_REF_NAME}" | sed 's/^v//')
           if [ "$ACTUAL" != "$EXPECTED" ]; then
             echo "Tag ${GITHUB_REF_NAME} is not sequential. Expected v${EXPECTED}."
