@@ -16,7 +16,6 @@ const usage =
     \\  add        Add a publication
     \\  relate     Create a relationship between publications
     \\  list       List publications
-    \\  search     Search publications
     \\  merge      Merge two ken databases
     \\  skill      Generate agent skills
     \\  pubkind    Manage publication kinds
@@ -33,7 +32,6 @@ const Command = enum {
     add,
     relate,
     list,
-    search,
     merge,
     skill,
     pubkind,
