@@ -18,13 +18,6 @@ as a critical use case. It makes it easy to export references into a fresh datab
 Each version of `ken` comes with a schema migration that can be applied to any `ken` DB from an earlier release
 to make it compatible with the latest specification. We make the guarantee that these migrations will never fail.
 
-### Multiple databases
-
-Researchers can maintain as many `ken` databases as they like — one per research interest, one per
-AI agent, or any other scheme. Every command that operates on a database accepts `-D/--db <path>`
-to target a specific database. If omitted, the default platform-specific path is used
-(e.g. `~/Library/Application Support/ken/ken.db` on macOS).
-
 ### Database schema
 
 #### Publication kinds
@@ -108,3 +101,11 @@ without external documentation, every command and subcommand responds to `-h`/`-
 text scoped to that specific context. `ken -h` shows top-level help, `ken pubkind -h` shows help
 for `pubkind`, and `ken pubkind list -h` shows help for `pubkind list`. Any level of the command
 hierarchy can be explored this way.
+
+### Multiple databases
+
+Researchers can maintain as many `ken` databases as they like — one per research interest, one per
+AI agent, or any other scheme. Every command that operates on a database accepts `-D/--db <path>`
+to target a specific database. If omitted, the default platform-specific path is used
+(e.g. `~/Library/Application Support/ken/ken.db` on macOS).
+
