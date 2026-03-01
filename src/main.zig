@@ -52,8 +52,8 @@ fn printCommandUsage(cmd: Command, stdout: anytype) !void {
         .pubkind => try stdout.writeAll(ken.kindUsage(.pubkind)),
         .relkind => try stdout.writeAll(ken.kindUsage(.relkind)),
         .merge => try stdout.writeAll(ken.mergeUsage),
+        .skill => try stdout.writeAll(ken.skillUsage),
         .help => try stdout.writeAll(usage),
-        inline else => |tag| try stdout.writeAll("Usage: ken " ++ @tagName(tag) ++ " [options]\n\n" ++ @tagName(tag) ++ ": not yet implemented\n"),
     }
 }
 
@@ -462,9 +462,9 @@ pub fn main(process: std.process.Init) !void {
             };
             try stdout.flush();
         },
-        inline else => |tag| {
-            try stderr.print("{s}: not yet implemented\n", .{@tagName(tag)});
-            try stderr.flush();
+        .skill => {
+            try stdout.writeAll(ken.skillContent);
+            try stdout.flush();
         },
     }
 }

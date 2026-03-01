@@ -945,6 +945,175 @@ pub fn executeMergeAction(
     }) catch return error.SqlFailed;
 }
 
+// ── Skill ──
+
+pub const skillUsage =
+    \\Usage: ken skill
+    \\
+    \\Print an Agent Skills spec (agentskills.io) SKILL.md to stdout.
+    \\Pipe to a file to install, e.g.:
+    \\  mkdir -p ~/.claude/skills/ken && ken skill > ~/.claude/skills/ken/SKILL.md
+    \\
+;
+
+pub const skillContent =
+    \\---
+    \\name: ken
+    \\description: >-
+    \\  Catalog and query research literature (books, papers, articles, videos)
+    \\  using the ken CLI. Use when the user asks to track publications, organize
+    \\  references, take research notes, or explore relationships between works.
+    \\---
+    \\
+    \\# ken
+    \\
+    \\ken is a research literature catalog. It stores publications (books, papers,
+    \\articles, videos, web pages), your notes about them, and directed relationships
+    \\between them in a SQLite database. The database schema is the core of ken —
+    \\the CLI is a thin wrapper that encapsulates its assumptions.
+    \\
+    \\## Design principles
+    \\
+    \\- Every command and subcommand responds to `-h`/`--help` with scoped help text.
+    \\  Explore the CLI by running `ken -h`, `ken add -h`, `ken pubkind list -h`, etc.
+    \\- All output intended for machine consumption is JSON.
+    \\- Every database command accepts `-D/--db <path>` to target a specific database.
+    \\  If omitted, a platform-specific default is used (run `ken initpath` to see it).
+    \\- Users can maintain multiple databases — one per research interest, one per
+    \\  agent, or any other scheme. Databases are regular SQLite files that can be
+    \\  copied, shared, and merged.
+    \\- The database can be queried directly with SQL. Prefer the CLI when possible,
+    \\  as it encapsulates schema assumptions (FK constraints, UUID generation,
+    \\  timestamps, conflict resolution).
+    \\
+    \\## Setup
+    \\
+    \\```sh
+    \\# Create or upgrade the default database
+    \\ken init
+    \\
+    \\# Create a database at a specific path
+    \\ken -D ~/research/ml.db init
+    \\
+    \\# Print the default database path
+    \\ken initpath
+    \\```
+    \\
+    \\## Adding publications
+    \\
+    \\```sh
+    \\ken [-D <path>] add <kind> [-k/--key <key>] [--title <title>]
+    \\```
+    \\
+    \\Prints the UUID of the new publication to stdout.
+    \\
+    \\Built-in publication kinds and their key formats:
+    \\- `arxiv` — arXiv identifier (e.g. `2301.07041`). URL: `https://arxiv.org/abs/{key}`
+    \\- `video` — YouTube video ID (11 chars). URL: `https://www.youtube.com/watch?v={key}`
+    \\- `web` — full URL including scheme (e.g. `https://example.com/page`)
+    \\- `note` — key is optional; if provided, treated as a file path whose contents
+    \\  are read into the notes table
+    \\
+    \\Users can add custom kinds via `ken pubkind add`. The kind's description should
+    \\specify how to interpret the key field.
+    \\
+    \\Examples:
+    \\```sh
+    \\ken add arxiv -k 2301.07041 --title "Scaling Laws for Neural Language Models"
+    \\ken add web -k https://example.com/survey --title "ML Survey"
+    \\ken add note --title "Thoughts on attention"
+    \\ken add note -k ./notes/attention.md --title "Attention notes from file"
+    \\```
+    \\
+    \\## Listing publications
+    \\
+    \\```sh
+    \\ken [-D <path>] list [--kind <kind>] [--limit N] [--offset N]
+    \\```
+    \\
+    \\Outputs a JSON array of objects with `id`, `kind`, `title`, `key` fields.
+    \\
+    \\Examples:
+    \\```sh
+    \\ken list
+    \\ken list --kind arxiv --limit 10
+    \\ken list --offset 20 --limit 10
+    \\```
+    \\
+    \\## Relationships
+    \\
+    \\Relationships are directed: each has a subject and an object.
+    \\
+    \\```sh
+    \\ken [-D <path>] relate -s <subject-id> -o <object-id> -r <kind>
+    \\```
+    \\
+    \\Prints the UUID of the new relationship to stdout. Users define relationship
+    \\kinds via `ken relkind add` (e.g. `cites`, `develops`, `duplicates`).
+    \\
+    \\Example:
+    \\```sh
+    \\ken relkind add cites "Subject cites object as a reference."
+    \\ID1=$(ken add arxiv -k 2301.07041 --title "Paper A")
+    \\ID2=$(ken add arxiv -k 2405.00001 --title "Paper B")
+    \\ken relate -s $ID1 -o $ID2 -r cites
+    \\```
+    \\
+    \\## Managing kinds
+    \\
+    \\Publication kinds and relationship kinds each have `show`, `list`, `add`,
+    \\`remove`, and `update` subcommands.
+    \\
+    \\```sh
+    \\ken pubkind list --descriptions    # list publication kinds with descriptions
+    \\ken pubkind show arxiv             # show one kind as JSON
+    \\ken pubkind add book "Keyed by ISBN-13. URL: https://isbnsearch.org/isbn/{key}"
+    \\ken pubkind update arxiv --description "Updated description"
+    \\ken pubkind remove book            # fails if publications of this kind exist
+    \\
+    \\ken relkind add cites "Subject cites object as a reference."
+    \\ken relkind list
+    \\```
+    \\
+    \\Kind descriptions are critical — they tell both humans and AI how to interpret
+    \\keys and relationships. Write them precisely.
+    \\
+    \\## Merging databases
+    \\
+    \\```sh
+    \\ken [-D <path>] merge -f <source-path> [--check] [--nocheck] [--force]
+    \\```
+    \\
+    \\Imports data from source into target in a single transaction. Outputs JSON
+    \\with insertion counts on success.
+    \\
+    \\- No flag: abort if kind description conflicts exist, merge otherwise.
+    \\- `--check`: only detect conflicts, don't merge.
+    \\- `--force`: merge despite conflicts (target descriptions win).
+    \\- `--nocheck`: skip conflict detection entirely.
+    \\
+    \\Example:
+    \\```sh
+    \\ken -D combined.db merge -f agent1.db
+    \\ken -D combined.db merge -f agent2.db --force
+    \\```
+    \\
+    \\## Workflow example
+    \\
+    \\```sh
+    \\ken init
+    \\ken pubkind add book "Keyed by ISBN-13."
+    \\ken relkind add cites "Subject cites object as a reference."
+    \\
+    \\A=$(ken add arxiv -k 2301.07041 --title "Chinchilla")
+    \\B=$(ken add arxiv -k 2005.14165 --title "GPT-3")
+    \\ken relate -s $A -o $B -r cites
+    \\
+    \\ken list --kind arxiv
+    \\```
+    \\
+;
+
 // ── Tests ──
 
 const testing = std.testing;
