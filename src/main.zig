@@ -50,6 +50,7 @@ fn printCommandUsage(cmd: Command, stdout: anytype) !void {
         .list => try stdout.writeAll(ken.listUsage),
         .pubkind => try stdout.writeAll(ken.kindUsage(.pubkind)),
         .relkind => try stdout.writeAll(ken.kindUsage(.relkind)),
+        .merge => try stdout.writeAll(ken.mergeUsage),
         .help => try stdout.writeAll(usage),
         inline else => |tag| try stdout.writeAll("Usage: ken " ++ @tagName(tag) ++ " [options]\n\n" ++ @tagName(tag) ++ ": not yet implemented\n"),
     }
@@ -112,7 +113,7 @@ pub fn main(process: std.process.Init) !void {
     // own parsers (add) handle -h internally so help is scoped to the
     // specific subcommand being asked about.
     switch (cmd) {
-        .pubkind, .relkind, .add, .relate, .list => {},
+        .pubkind, .relkind, .add, .relate, .list, .merge => {},
         else => {
             if (hasHelpFlag(args[2..])) {
                 try printCommandUsage(cmd, stdout);
@@ -395,6 +396,39 @@ pub fn main(process: std.process.Init) !void {
 
             ken.executeListAction(&database, arena, action, stdout) catch {
                 try stderr.print("Error: could not list publications\n", .{});
+                try stderr.flush();
+                return;
+            };
+            try stdout.flush();
+        },
+        .merge => {
+            const action = ken.parseMergeArgs(args, 1) catch |err| {
+                if (err == error.HelpRequested) {
+                    try stdout.writeAll(ken.mergeUsage);
+                    try stdout.flush();
+                    return;
+                }
+                switch (err) {
+                    error.MissingArgument => try stderr.print("Error: missing source path. Usage: ken merge <source-path> [--check|--nocheck|--force]\n", .{}),
+                    error.UnknownFlag => try stderr.print("Error: unknown or conflicting flag. Usage: ken merge <source-path> [--check|--nocheck|--force]\n", .{}),
+                    else => try stderr.print("Error: invalid arguments for 'merge'\n", .{}),
+                }
+                try stderr.flush();
+                return;
+            };
+
+            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
+            var database = ken.db.Db.open(db_path) catch {
+                try stderr.print("Error: could not open database '{s}'\n", .{db_path});
+                try stderr.flush();
+                return;
+            };
+            defer database.close();
+
+            ken.executeMergeAction(&database, arena, action, stdout, stderr) catch |err| {
+                if (err == error.KindConflict) {
+                    try stderr.print("Error: merge aborted due to kind conflicts (use --force to override)\n", .{});
+                }
                 try stderr.flush();
                 return;
             };

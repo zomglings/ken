@@ -109,3 +109,52 @@ AI agent, or any other scheme. Every command that operates on a database accepts
 to target a specific database. If omitted, the default platform-specific path is used
 (e.g. `~/Library/Application Support/ken/ken.db` on macOS).
 
+### Merging databases
+
+`ken merge` imports data from a source database into the target database. The entire merge runs in
+a single SQLite transaction for atomicity.
+
+```
+ken [-D <path>] merge <source-path> [--check] [--nocheck] [--force]
+```
+
+Flags:
+- No flag (default): check for kind conflicts first; abort if any are found, merge otherwise.
+- `--check`: only check for conflicts, don't merge. Exit 0 if clean, 1 if conflicts.
+- `--nocheck`: skip conflict detection, run INSERT OR IGNORE for all tables. Target wins on kind
+  name collisions.
+- `--force`: check for conflicts, report them as warnings, then merge anyway. Target descriptions
+  win.
+
+Conflict resolution:
+- Kind tables (`publication_kinds`, `relationship_kinds`): same name + same description is silently
+  skipped. Same name + different description is a conflict. Kind descriptions serve as specifications
+  for both humans and AI, so conflicting descriptions require explicit resolution.
+- UUID-keyed tables (`publications`, `relationships`, `notes`): same id is skipped via INSERT OR
+  IGNORE. UUID identity is authoritative.
+
+Tables are merged in FK-safe order: publication_kinds, relationship_kinds, publications,
+relationships, notes.
+
+Example workflows:
+
+```sh
+# Basic merge
+ken -D target.db merge source.db
+
+# Check for conflicts before merging
+ken -D target.db merge --check source.db
+
+# Force merge (target descriptions win on conflicts)
+ken -D target.db merge --force source.db
+
+# Skip all checks (fastest, target wins on collisions)
+ken -D target.db merge --nocheck source.db
+```
+
+On success, merge outputs a JSON object with insertion counts:
+
+```json
+{"publication_kinds":2,"relationship_kinds":1,"publications":15,"relationships":8,"notes":3}
+```
+

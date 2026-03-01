@@ -678,6 +678,271 @@ pub fn formatKindError(
     }
 }
 
+// ── Merge ──
+
+pub const mergeUsage =
+    \\Usage: ken [-D <path>] merge <source-path> [--check] [--nocheck] [--force]
+    \\
+    \\Merge a source ken database into the target database.
+    \\Data flows from source into the target (opened via -D or default path).
+    \\The entire merge runs in a single transaction for atomicity.
+    \\
+    \\Options:
+    \\  -D, --db <path>  Path to target ken database (default: platform-specific)
+    \\
+    \\Flags:
+    \\  --check    Only check for kind conflicts, don't merge.
+    \\             Exit 0 if clean, exit 1 if conflicts found.
+    \\  --nocheck  Skip conflict check, just run the merge (ROLLBACK on failure).
+    \\             Kind conflicts resolved in favor of the target.
+    \\  --force    Merge even if kind conflicts exist. Target descriptions win.
+    \\
+    \\If no flag is given, conflicts are checked first. If any are found the
+    \\merge is aborted with an error. Otherwise the merge proceeds.
+    \\
+    \\Conflict resolution:
+    \\  Kinds (publication_kinds, relationship_kinds): same name + same description
+    \\  is silently skipped. Same name + different description is a conflict.
+    \\  UUID-keyed tables (publications, relationships, notes): same id is skipped.
+    \\
+;
+
+pub const MergeMode = enum {
+    default,
+    check,
+    nocheck,
+    force,
+};
+
+pub const MergeAction = struct {
+    source_path: []const u8,
+    mode: MergeMode = .default,
+};
+
+pub const MergeError = error{
+    SqlFailed,
+    InvalidSource,
+    KindConflict,
+};
+
+pub const MergeCounts = struct {
+    publication_kinds: i32 = 0,
+    relationship_kinds: i32 = 0,
+    publications: i32 = 0,
+    relationships: i32 = 0,
+    notes: i32 = 0,
+};
+
+/// Parse arguments for `ken merge <source-path> [--check|--nocheck|--force]`.
+/// `args` is full argv; `cmd_index` is the index of "merge".
+pub fn parseMergeArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!MergeAction {
+    const rest = args[cmd_index + 1 ..];
+    if (rest.len == 0) return error.MissingArgument;
+
+    var result = MergeAction{ .source_path = undefined };
+    var have_source = false;
+    var mode_count: u32 = 0;
+
+    for (rest) |arg| {
+        const a: []const u8 = arg;
+        if (isHelpFlag(a)) return error.HelpRequested;
+        if (std.mem.eql(u8, a, "--check")) {
+            result.mode = .check;
+            mode_count += 1;
+        } else if (std.mem.eql(u8, a, "--nocheck")) {
+            result.mode = .nocheck;
+            mode_count += 1;
+        } else if (std.mem.eql(u8, a, "--force")) {
+            result.mode = .force;
+            mode_count += 1;
+        } else if (a.len > 0 and a[0] == '-') {
+            return error.UnknownFlag;
+        } else {
+            if (have_source) return error.UnknownFlag; // extra positional
+            result.source_path = a;
+            have_source = true;
+        }
+    }
+
+    if (!have_source) return error.MissingArgument;
+    if (mode_count > 1) return error.UnknownFlag;
+
+    return result;
+}
+
+/// Execute a merge action: import data from source into the target database.
+pub fn executeMergeAction(
+    database: *db.Db,
+    allocator: std.mem.Allocator,
+    action: MergeAction,
+    stdout: anytype,
+    stderr: anytype,
+) MergeError!void {
+    // ATTACH source database
+    database.execParams(
+        "ATTACH DATABASE ?1 AS src;",
+        &.{action.source_path},
+    ) catch {
+        stderr.print("Error: could not attach source database '{s}'\n", .{action.source_path}) catch {};
+        return error.SqlFailed;
+    };
+    defer database.exec("DETACH DATABASE src;") catch {};
+
+    // Validate source has _ken_meta table
+    const has_meta = database.exists(
+        "SELECT 1 FROM src.sqlite_master WHERE type='table' AND name='_ken_meta';",
+        &.{},
+    ) catch {
+        stderr.print("Error: could not read source database\n", .{}) catch {};
+        return error.SqlFailed;
+    };
+    if (!has_meta) {
+        stderr.print("Error: source is not a ken database\n", .{}) catch {};
+        return error.InvalidSource;
+    }
+
+    // Conflict detection (unless --nocheck)
+    if (action.mode != .nocheck) {
+        const pub_conflicts = database.queryRows(
+            2,
+            allocator,
+            \\SELECT s.name, s.description FROM src.publication_kinds s
+            \\INNER JOIN main.publication_kinds m ON s.name = m.name
+            \\WHERE s.description != m.description;
+        ,
+            &.{},
+        ) catch {
+            stderr.print("Error: conflict detection query failed\n", .{}) catch {};
+            return error.SqlFailed;
+        };
+
+        const rel_conflicts = database.queryRows(
+            2,
+            allocator,
+            \\SELECT s.name, s.description FROM src.relationship_kinds s
+            \\INNER JOIN main.relationship_kinds m ON s.name = m.name
+            \\WHERE s.description != m.description;
+        ,
+            &.{},
+        ) catch {
+            db.Db.freeRows(2, allocator, pub_conflicts);
+            stderr.print("Error: conflict detection query failed\n", .{}) catch {};
+            return error.SqlFailed;
+        };
+
+        const total_conflicts = pub_conflicts.len + rel_conflicts.len;
+
+        if (action.mode == .check) {
+            // Report and return without modifying data
+            for (pub_conflicts) |row| {
+                stderr.print("Error: conflicting publication kind '{s}' (descriptions differ between source and target)\n", .{row[0]}) catch {};
+            }
+            for (rel_conflicts) |row| {
+                stderr.print("Error: conflicting relationship kind '{s}' (descriptions differ between source and target)\n", .{row[0]}) catch {};
+            }
+            db.Db.freeRows(2, allocator, pub_conflicts);
+            db.Db.freeRows(2, allocator, rel_conflicts);
+            if (total_conflicts > 0) {
+                stdout.print("{{\"conflicts\":{d}}}\n", .{total_conflicts}) catch {};
+                return error.KindConflict;
+            }
+            stdout.print("{{\"conflicts\":0}}\n", .{}) catch {};
+            return;
+        }
+
+        if (action.mode == .default and total_conflicts > 0) {
+            for (pub_conflicts) |row| {
+                stderr.print("Error: conflicting publication kind '{s}' (descriptions differ between source and target)\n", .{row[0]}) catch {};
+            }
+            for (rel_conflicts) |row| {
+                stderr.print("Error: conflicting relationship kind '{s}' (descriptions differ between source and target)\n", .{row[0]}) catch {};
+            }
+            db.Db.freeRows(2, allocator, pub_conflicts);
+            db.Db.freeRows(2, allocator, rel_conflicts);
+            return error.KindConflict;
+        }
+
+        if (action.mode == .force and total_conflicts > 0) {
+            for (pub_conflicts) |row| {
+                stderr.print("Warning: conflicting publication kind '{s}' (keeping target description)\n", .{row[0]}) catch {};
+            }
+            for (rel_conflicts) |row| {
+                stderr.print("Warning: conflicting relationship kind '{s}' (keeping target description)\n", .{row[0]}) catch {};
+            }
+        }
+
+        db.Db.freeRows(2, allocator, pub_conflicts);
+        db.Db.freeRows(2, allocator, rel_conflicts);
+    }
+
+    // Run the merge transaction
+    database.exec("BEGIN;") catch {
+        stderr.print("Error: could not begin transaction\n", .{}) catch {};
+        return error.SqlFailed;
+    };
+    errdefer database.exec("ROLLBACK;") catch {};
+
+    var counts = MergeCounts{};
+
+    // 1. publication_kinds
+    database.exec(
+        "INSERT OR IGNORE INTO main.publication_kinds (name, description) SELECT name, description FROM src.publication_kinds;",
+    ) catch {
+        stderr.print("Error: failed to merge publication kinds\n", .{}) catch {};
+        return error.SqlFailed;
+    };
+    counts.publication_kinds = database.changes();
+
+    // 2. relationship_kinds
+    database.exec(
+        "INSERT OR IGNORE INTO main.relationship_kinds (name, description) SELECT name, description FROM src.relationship_kinds;",
+    ) catch {
+        stderr.print("Error: failed to merge relationship kinds\n", .{}) catch {};
+        return error.SqlFailed;
+    };
+    counts.relationship_kinds = database.changes();
+
+    // 3. publications
+    database.exec(
+        "INSERT OR IGNORE INTO main.publications (id, key, kind, title, created_at, updated_at) SELECT id, key, kind, title, created_at, updated_at FROM src.publications;",
+    ) catch {
+        stderr.print("Error: failed to merge publications\n", .{}) catch {};
+        return error.SqlFailed;
+    };
+    counts.publications = database.changes();
+
+    // 4. relationships
+    database.exec(
+        "INSERT OR IGNORE INTO main.relationships (id, subject, object, kind, created_at) SELECT id, subject, object, kind, created_at FROM src.relationships;",
+    ) catch {
+        stderr.print("Error: failed to merge relationships\n", .{}) catch {};
+        return error.SqlFailed;
+    };
+    counts.relationships = database.changes();
+
+    // 5. notes
+    database.exec(
+        "INSERT OR IGNORE INTO main.notes (id, publication, body, created_at, updated_at) SELECT id, publication, body, created_at, updated_at FROM src.notes;",
+    ) catch {
+        stderr.print("Error: failed to merge notes\n", .{}) catch {};
+        return error.SqlFailed;
+    };
+    counts.notes = database.changes();
+
+    database.exec("COMMIT;") catch {
+        stderr.print("Error: could not commit transaction\n", .{}) catch {};
+        return error.SqlFailed;
+    };
+
+    stdout.print("{{\"publication_kinds\":{d},\"relationship_kinds\":{d},\"publications\":{d},\"relationships\":{d},\"notes\":{d}}}\n", .{
+        counts.publication_kinds,
+        counts.relationship_kinds,
+        counts.publications,
+        counts.relationships,
+        counts.notes,
+    }) catch {};
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -1116,4 +1381,336 @@ test "executeKindAction: list with --descriptions" {
     const output = out.buffered();
     try testing.expect(std.mem.indexOf(u8, output, "\"description\":") != null);
     try testing.expect(std.mem.indexOf(u8, output, "\"name\":\"arxiv\"") != null);
+}
+
+// ── parseMergeArgs tests ──
+
+test "merge: source path only" {
+    const args = mkArgs(&.{ "ken", "merge", "source.db" });
+    const action = try parseMergeArgs(&args, 1);
+    try testing.expectEqualStrings("source.db", action.source_path);
+    try testing.expect(action.mode == .default);
+}
+
+test "merge: --check flag" {
+    const args = mkArgs(&.{ "ken", "merge", "source.db", "--check" });
+    const action = try parseMergeArgs(&args, 1);
+    try testing.expectEqualStrings("source.db", action.source_path);
+    try testing.expect(action.mode == .check);
+}
+
+test "merge: --nocheck flag" {
+    const args = mkArgs(&.{ "ken", "merge", "--nocheck", "source.db" });
+    const action = try parseMergeArgs(&args, 1);
+    try testing.expectEqualStrings("source.db", action.source_path);
+    try testing.expect(action.mode == .nocheck);
+}
+
+test "merge: --force flag" {
+    const args = mkArgs(&.{ "ken", "merge", "source.db", "--force" });
+    const action = try parseMergeArgs(&args, 1);
+    try testing.expectEqualStrings("source.db", action.source_path);
+    try testing.expect(action.mode == .force);
+}
+
+test "merge: missing source path" {
+    const args = mkArgs(&.{ "ken", "merge" });
+    const result = parseMergeArgs(&args, 1);
+    try testing.expectError(error.MissingArgument, result);
+}
+
+test "merge: help flag" {
+    const args = mkArgs(&.{ "ken", "merge", "-h" });
+    const result = parseMergeArgs(&args, 1);
+    try testing.expectError(error.HelpRequested, result);
+}
+
+test "merge: help flag with source" {
+    const args = mkArgs(&.{ "ken", "merge", "source.db", "--help" });
+    const result = parseMergeArgs(&args, 1);
+    try testing.expectError(error.HelpRequested, result);
+}
+
+test "merge: unknown flag" {
+    const args = mkArgs(&.{ "ken", "merge", "source.db", "--bogus" });
+    const result = parseMergeArgs(&args, 1);
+    try testing.expectError(error.UnknownFlag, result);
+}
+
+test "merge: multiple mode flags rejected" {
+    const args = mkArgs(&.{ "ken", "merge", "source.db", "--check", "--force" });
+    const result = parseMergeArgs(&args, 1);
+    try testing.expectError(error.UnknownFlag, result);
+}
+
+test "merge: flag-only (no source)" {
+    const args = mkArgs(&.{ "ken", "merge", "--check" });
+    const result = parseMergeArgs(&args, 1);
+    try testing.expectError(error.MissingArgument, result);
+}
+
+// ── executeMergeAction tests ──
+
+/// Create a temporary file-based ken database for merge tests.
+/// Returns the path (caller must clean up) and the open Db.
+fn testFileDb(comptime path: [*:0]const u8) !db.Db {
+    var database = try db.Db.open(path);
+    _ = try database.migrate(migrations);
+    return database;
+}
+
+fn deleteTmpDb(comptime path: [*:0]const u8) void {
+    _ = std.c.unlink(path);
+}
+
+test "executeMergeAction: basic merge imports publications" {
+    defer deleteTmpDb("_test_merge_target.db");
+    defer deleteTmpDb("_test_merge_source.db");
+
+    // Set up source with a publication
+    {
+        var src = try testFileDb("_test_merge_source.db");
+        defer src.close();
+        try src.execParams(
+            "INSERT INTO publications (id, kind, title) VALUES (?1, ?2, ?3);",
+            &.{ "aaaa-bbbb-cccc-dddd", "arxiv", "Paper A" },
+        );
+    }
+
+    // Set up target (empty)
+    var target = try testFileDb("_test_merge_target.db");
+    defer target.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try executeMergeAction(&target, testing.allocator, .{ .source_path = "_test_merge_source.db" }, &out, &err_w);
+    const output = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output, "\"publications\":1") != null);
+}
+
+test "executeMergeAction: idempotent merge (second merge inserts 0)" {
+    defer deleteTmpDb("_test_merge_idem_target.db");
+    defer deleteTmpDb("_test_merge_idem_source.db");
+
+    {
+        var src = try testFileDb("_test_merge_idem_source.db");
+        defer src.close();
+        try src.execParams(
+            "INSERT INTO publications (id, kind, title) VALUES (?1, ?2, ?3);",
+            &.{ "1111-2222-3333-4444", "arxiv", "Paper B" },
+        );
+    }
+
+    var target = try testFileDb("_test_merge_idem_target.db");
+    defer target.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    // First merge
+    try executeMergeAction(&target, testing.allocator, .{ .source_path = "_test_merge_idem_source.db" }, &out, &err_w);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"publications\":1") != null);
+
+    // Second merge — should insert 0
+    out.end = 0;
+    err_w.end = 0;
+    try executeMergeAction(&target, testing.allocator, .{ .source_path = "_test_merge_idem_source.db" }, &out, &err_w);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"publications\":0") != null);
+}
+
+test "executeMergeAction: --check with no conflicts" {
+    defer deleteTmpDb("_test_merge_chk_target.db");
+    defer deleteTmpDb("_test_merge_chk_source.db");
+
+    {
+        var src = try testFileDb("_test_merge_chk_source.db");
+        defer src.close();
+    }
+
+    var target = try testFileDb("_test_merge_chk_target.db");
+    defer target.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try executeMergeAction(&target, testing.allocator, .{ .source_path = "_test_merge_chk_source.db", .mode = .check }, &out, &err_w);
+    try testing.expectEqualStrings("{\"conflicts\":0}\n", out.buffered());
+}
+
+test "executeMergeAction: --check with conflicts" {
+    defer deleteTmpDb("_test_merge_chkc_target.db");
+    defer deleteTmpDb("_test_merge_chkc_source.db");
+
+    {
+        var src = try testFileDb("_test_merge_chkc_source.db");
+        defer src.close();
+        // Change the description of 'arxiv' in source
+        try src.execParams(
+            "UPDATE publication_kinds SET description = ?1 WHERE name = ?2;",
+            &.{ "Different description", "arxiv" },
+        );
+    }
+
+    var target = try testFileDb("_test_merge_chkc_target.db");
+    defer target.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const result = executeMergeAction(&target, testing.allocator, .{ .source_path = "_test_merge_chkc_source.db", .mode = .check }, &out, &err_w);
+    try testing.expectError(error.KindConflict, result);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"conflicts\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "conflicting publication kind 'arxiv'") != null);
+}
+
+test "executeMergeAction: default mode aborts on conflict" {
+    defer deleteTmpDb("_test_merge_def_target.db");
+    defer deleteTmpDb("_test_merge_def_source.db");
+
+    {
+        var src = try testFileDb("_test_merge_def_source.db");
+        defer src.close();
+        try src.execParams(
+            "UPDATE publication_kinds SET description = ?1 WHERE name = ?2;",
+            &.{ "Conflicting desc", "note" },
+        );
+    }
+
+    var target = try testFileDb("_test_merge_def_target.db");
+    defer target.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const result = executeMergeAction(&target, testing.allocator, .{ .source_path = "_test_merge_def_source.db" }, &out, &err_w);
+    try testing.expectError(error.KindConflict, result);
+    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "conflicting publication kind 'note'") != null);
+}
+
+test "executeMergeAction: --force merges despite conflicts" {
+    defer deleteTmpDb("_test_merge_force_target.db");
+    defer deleteTmpDb("_test_merge_force_source.db");
+
+    {
+        var src = try testFileDb("_test_merge_force_source.db");
+        defer src.close();
+        try src.execParams(
+            "UPDATE publication_kinds SET description = ?1 WHERE name = ?2;",
+            &.{ "Conflicting desc", "note" },
+        );
+        try src.execParams(
+            "INSERT INTO publications (id, kind, title) VALUES (?1, ?2, ?3);",
+            &.{ "force-uuid-1234", "note", "Force note" },
+        );
+    }
+
+    var target = try testFileDb("_test_merge_force_target.db");
+    defer target.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try executeMergeAction(&target, testing.allocator, .{ .source_path = "_test_merge_force_source.db", .mode = .force }, &out, &err_w);
+    // Should succeed and import the publication
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"publications\":1") != null);
+    // Should print warning
+    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "Warning:") != null);
+}
+
+test "executeMergeAction: --nocheck skips conflict detection" {
+    defer deleteTmpDb("_test_merge_nochk_target.db");
+    defer deleteTmpDb("_test_merge_nochk_source.db");
+
+    {
+        var src = try testFileDb("_test_merge_nochk_source.db");
+        defer src.close();
+        try src.execParams(
+            "UPDATE publication_kinds SET description = ?1 WHERE name = ?2;",
+            &.{ "Different desc", "video" },
+        );
+        try src.execParams(
+            "INSERT INTO publications (id, kind, title) VALUES (?1, ?2, ?3);",
+            &.{ "nochk-uuid-5678", "video", "Some video" },
+        );
+    }
+
+    var target = try testFileDb("_test_merge_nochk_target.db");
+    defer target.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try executeMergeAction(&target, testing.allocator, .{ .source_path = "_test_merge_nochk_source.db", .mode = .nocheck }, &out, &err_w);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"publications\":1") != null);
+    // No warnings should be printed (no conflict check)
+    try testing.expectEqualStrings("", err_w.buffered());
+}
+
+test "executeMergeAction: invalid source (not a ken db)" {
+    defer deleteTmpDb("_test_merge_inv_target.db");
+    defer deleteTmpDb("_test_merge_inv_source.db");
+
+    // Create a plain SQLite database (no _ken_meta)
+    {
+        var src = try db.Db.open("_test_merge_inv_source.db");
+        defer src.close();
+        try src.exec("CREATE TABLE foo (id INTEGER);");
+    }
+
+    var target = try testFileDb("_test_merge_inv_target.db");
+    defer target.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const result = executeMergeAction(&target, testing.allocator, .{ .source_path = "_test_merge_inv_source.db" }, &out, &err_w);
+    try testing.expectError(error.InvalidSource, result);
+    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "source is not a ken database") != null);
+}
+
+test "executeMergeAction: merges new publication kind from source" {
+    defer deleteTmpDb("_test_merge_newkind_target.db");
+    defer deleteTmpDb("_test_merge_newkind_source.db");
+
+    {
+        var src = try testFileDb("_test_merge_newkind_source.db");
+        defer src.close();
+        try src.execParams(
+            "INSERT INTO publication_kinds (name, description) VALUES (?1, ?2);",
+            &.{ "book", "Keyed by ISBN" },
+        );
+    }
+
+    var target = try testFileDb("_test_merge_newkind_target.db");
+    defer target.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try executeMergeAction(&target, testing.allocator, .{ .source_path = "_test_merge_newkind_source.db" }, &out, &err_w);
+    // Should have imported the new kind
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"publication_kinds\":1") != null);
+
+    // Verify the kind exists in target
+    const exists = try target.exists("SELECT 1 FROM publication_kinds WHERE name = ?1;", &.{"book"});
+    try testing.expect(exists);
 }
