@@ -86,6 +86,9 @@ pub const migrations: []const [*:0]const u8 = &.{
     \\INSERT INTO publication_kinds (name, description) VALUES ('arxiv', 'A preprint hosted on arXiv (arxiv.org). The key is the arXiv identifier, e.g. "2301.07041" for recent papers or "math.AG/0601185" for older ones. To construct the abstract page URL, use https://arxiv.org/abs/{key}. To get the PDF directly, use https://arxiv.org/pdf/{key}. The arXiv API endpoint for metadata is http://export.arxiv.org/api/query?id_list={key}.');
     \\INSERT INTO publication_kinds (name, description) VALUES ('video', 'A YouTube video. The key is the YouTube video ID, which is the 11-character v parameter from a watch URL. To construct the watch URL, use https://www.youtube.com/watch?v={key}. To construct a thumbnail URL, use https://img.youtube.com/vi/{key}/0.jpg. To construct an embed URL, use https://www.youtube.com/embed/{key}.');
     \\INSERT INTO publication_kinds (name, description) VALUES ('web', 'A web page or online resource. The key is the full URL including the scheme (e.g. https://example.com/page). No transformation is needed to visit the resource; the key itself is the link. This is the most general publication kind and can be used for any online resource that does not fit a more specific kind.');
+    \\INSERT INTO publication_kinds (name, description) VALUES ('topic', 'A research topic or area of study. Used as a conceptual node for organizing literature. The key field is optional; when provided it should be a short canonical identifier such as a Wikipedia URL or taxonomy code. The title should be the human-readable topic name (e.g. "Reinforcement Learning", "Category Theory").');
+    \\INSERT INTO relationship_kinds (name, description) VALUES ('cites', 'Subject cites object as a reference or source.');
+    \\INSERT INTO relationship_kinds (name, description) VALUES ('derives-from', 'Subject is derived from or builds upon object.');
     ,
 };
 
@@ -1013,6 +1016,8 @@ pub const skillContent =
     \\- `web` — full URL including scheme (e.g. `https://example.com/page`)
     \\- `note` — key is optional; if provided, treated as a file path whose contents
     \\  are read into the notes table
+    \\- `topic` — a conceptual node for organizing literature. Key is optional (e.g.
+    \\  Wikipedia URL or taxonomy code). Title is the human-readable topic name.
     \\
     \\Users can add custom kinds via `ken pubkind add`. The kind's description should
     \\specify how to interpret the key field.
@@ -1048,12 +1053,16 @@ pub const skillContent =
     \\ken [-D <path>] relate -s <subject-id> -o <object-id> -r <kind>
     \\```
     \\
-    \\Prints the UUID of the new relationship to stdout. Users define relationship
-    \\kinds via `ken relkind add` (e.g. `cites`, `develops`, `duplicates`).
+    \\Prints the UUID of the new relationship to stdout.
+    \\
+    \\Built-in relationship kinds:
+    \\- `cites` — subject cites object as a reference or source.
+    \\- `derives-from` — subject is derived from or builds upon object.
+    \\
+    \\Users can add custom kinds via `ken relkind add`.
     \\
     \\Example:
     \\```sh
-    \\ken relkind add cites "Subject cites object as a reference."
     \\ID1=$(ken add arxiv -k 2301.07041 --title "Paper A")
     \\ID2=$(ken add arxiv -k 2405.00001 --title "Paper B")
     \\ken relate -s $ID1 -o $ID2 -r cites
@@ -1071,8 +1080,8 @@ pub const skillContent =
     \\ken pubkind update arxiv --description "Updated description"
     \\ken pubkind remove book            # fails if publications of this kind exist
     \\
-    \\ken relkind add cites "Subject cites object as a reference."
-    \\ken relkind list
+    \\ken relkind list                   # list built-in and custom relationship kinds
+    \\ken relkind show cites              # show one relationship kind as JSON
     \\```
     \\
     \\Kind descriptions are critical — they tell both humans and AI how to interpret
@@ -1102,12 +1111,18 @@ pub const skillContent =
     \\
     \\```sh
     \\ken init
-    \\ken pubkind add book "Keyed by ISBN-13."
-    \\ken relkind add cites "Subject cites object as a reference."
     \\
+    \\# Add publications
     \\A=$(ken add arxiv -k 2301.07041 --title "Chinchilla")
     \\B=$(ken add arxiv -k 2005.14165 --title "GPT-3")
+    \\
+    \\# Use built-in relationship kinds directly
     \\ken relate -s $A -o $B -r cites
+    \\ken relate -s $A -o $B -r derives-from
+    \\
+    \\# Organize by topic
+    \\T=$(ken add topic --title "Scaling Laws")
+    \\ken relate -s $A -o $T -r derives-from
     \\
     \\ken list --kind arxiv
     \\```
@@ -1402,12 +1417,12 @@ test "executeKindAction: list with pagination" {
     try testing.expect(std.mem.indexOf(u8, output1, "\"name\":\"note\"") != null);
     try testing.expect(std.mem.indexOf(u8, output1, "\"name\":\"video\"") == null);
 
-    // Limit 2, offset 2 → next two (video, web)
+    // Limit 2, offset 2 → next two alphabetically (topic, video)
     out.end = 0;
     try executeKindAction(&database, testing.allocator, .pubkind, .{ .list = .{ .pagination = .{ .limit = 2, .offset = 2 } } }, &out, &err_w);
     const output2 = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output2, "\"name\":\"topic\"") != null);
     try testing.expect(std.mem.indexOf(u8, output2, "\"name\":\"video\"") != null);
-    try testing.expect(std.mem.indexOf(u8, output2, "\"name\":\"web\"") != null);
 }
 
 test "executeKindAction: duplicate add error" {
@@ -1517,12 +1532,15 @@ test "executeKindAction: relkind add and list" {
     var err_buf: [4096]u8 = undefined;
     var err_w: std.Io.Writer = .fixed(&err_buf);
 
-    try executeKindAction(&database, testing.allocator, .relkind, .{ .add = .{ .name = "cites", .description = "Subject cites object" } }, &out, &err_w);
-    try testing.expectEqualStrings("{\"name\":\"cites\",\"description\":\"Subject cites object\"}\n", out.buffered());
-
-    out.end = 0;
+    // Built-in kinds (cites, derives-from) should already be present
     try executeKindAction(&database, testing.allocator, .relkind, .{ .list = .{ .pagination = .{} } }, &out, &err_w);
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"name\":\"cites\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"name\":\"derives-from\"") != null);
+
+    // Adding a custom kind should work
+    out.end = 0;
+    try executeKindAction(&database, testing.allocator, .relkind, .{ .add = .{ .name = "develops", .description = "Subject develops object" } }, &out, &err_w);
+    try testing.expectEqualStrings("{\"name\":\"develops\",\"description\":\"Subject develops object\"}\n", out.buffered());
 }
 
 test "list: --descriptions flag" {
