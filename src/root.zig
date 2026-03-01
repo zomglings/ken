@@ -725,7 +725,7 @@ pub const MergeError = error{
     KindConflict,
 };
 
-pub const MergeCounts = struct {
+const MergeCounts = struct {
     publication_kinds: i32 = 0,
     relationship_kinds: i32 = 0,
     publications: i32 = 0,
@@ -801,6 +801,13 @@ pub fn executeMergeAction(
         return error.InvalidSource;
     }
 
+    // BEGIN IMMEDIATE so the conflict check and merge see a consistent snapshot.
+    database.exec("BEGIN IMMEDIATE;") catch {
+        stderr.print("Error: could not begin transaction\n", .{}) catch {};
+        return error.SqlFailed;
+    };
+    errdefer database.exec("ROLLBACK;") catch {};
+
     // Conflict detection (unless --nocheck)
     if (action.mode != .nocheck) {
         const pub_conflicts = database.queryRows(
@@ -815,6 +822,7 @@ pub fn executeMergeAction(
             stderr.print("Error: conflict detection query failed\n", .{}) catch {};
             return error.SqlFailed;
         };
+        defer db.Db.freeRows(2, allocator, pub_conflicts);
 
         const rel_conflicts = database.queryRows(
             2,
@@ -825,66 +833,47 @@ pub fn executeMergeAction(
         ,
             &.{},
         ) catch {
-            db.Db.freeRows(2, allocator, pub_conflicts);
             stderr.print("Error: conflict detection query failed\n", .{}) catch {};
             return error.SqlFailed;
         };
+        defer db.Db.freeRows(2, allocator, rel_conflicts);
 
         const total_conflicts = pub_conflicts.len + rel_conflicts.len;
 
-        if (action.mode == .check) {
-            // Report and return without modifying data
+        // Report conflicts (once, with mode-appropriate prefix)
+        if (total_conflicts > 0) {
+            const prefix: []const u8 = if (action.mode == .force) "Warning" else "Error";
+            const suffix: []const u8 = if (action.mode == .force)
+                "(keeping target description)"
+            else
+                "(descriptions differ between source and target)";
             for (pub_conflicts) |row| {
-                stderr.print("Error: conflicting publication kind '{s}' (descriptions differ between source and target)\n", .{row[0]}) catch {};
+                stderr.print("{s}: conflicting publication kind '{s}' {s}\n", .{ prefix, row[0], suffix }) catch {};
             }
             for (rel_conflicts) |row| {
-                stderr.print("Error: conflicting relationship kind '{s}' (descriptions differ between source and target)\n", .{row[0]}) catch {};
+                stderr.print("{s}: conflicting relationship kind '{s}' {s}\n", .{ prefix, row[0], suffix }) catch {};
             }
-            db.Db.freeRows(2, allocator, pub_conflicts);
-            db.Db.freeRows(2, allocator, rel_conflicts);
+        }
+
+        // Act on conflicts per mode
+        if (action.mode == .check) {
+            database.exec("ROLLBACK;") catch {};
             if (total_conflicts > 0) {
-                stdout.print("{{\"conflicts\":{d}}}\n", .{total_conflicts}) catch {};
+                stdout.print("{{\"conflicts\":{d}}}\n", .{total_conflicts}) catch return error.SqlFailed;
                 return error.KindConflict;
             }
-            stdout.print("{{\"conflicts\":0}}\n", .{}) catch {};
+            stdout.print("{{\"conflicts\":0}}\n", .{}) catch return error.SqlFailed;
             return;
         }
-
         if (action.mode == .default and total_conflicts > 0) {
-            for (pub_conflicts) |row| {
-                stderr.print("Error: conflicting publication kind '{s}' (descriptions differ between source and target)\n", .{row[0]}) catch {};
-            }
-            for (rel_conflicts) |row| {
-                stderr.print("Error: conflicting relationship kind '{s}' (descriptions differ between source and target)\n", .{row[0]}) catch {};
-            }
-            db.Db.freeRows(2, allocator, pub_conflicts);
-            db.Db.freeRows(2, allocator, rel_conflicts);
             return error.KindConflict;
         }
-
-        if (action.mode == .force and total_conflicts > 0) {
-            for (pub_conflicts) |row| {
-                stderr.print("Warning: conflicting publication kind '{s}' (keeping target description)\n", .{row[0]}) catch {};
-            }
-            for (rel_conflicts) |row| {
-                stderr.print("Warning: conflicting relationship kind '{s}' (keeping target description)\n", .{row[0]}) catch {};
-            }
-        }
-
-        db.Db.freeRows(2, allocator, pub_conflicts);
-        db.Db.freeRows(2, allocator, rel_conflicts);
+        // .force: fall through to merge
     }
 
-    // Run the merge transaction
-    database.exec("BEGIN;") catch {
-        stderr.print("Error: could not begin transaction\n", .{}) catch {};
-        return error.SqlFailed;
-    };
-    errdefer database.exec("ROLLBACK;") catch {};
-
+    // Insert tables in FK-safe order
     var counts = MergeCounts{};
 
-    // 1. publication_kinds
     database.exec(
         "INSERT OR IGNORE INTO main.publication_kinds (name, description) SELECT name, description FROM src.publication_kinds;",
     ) catch {
@@ -893,7 +882,6 @@ pub fn executeMergeAction(
     };
     counts.publication_kinds = database.changes();
 
-    // 2. relationship_kinds
     database.exec(
         "INSERT OR IGNORE INTO main.relationship_kinds (name, description) SELECT name, description FROM src.relationship_kinds;",
     ) catch {
@@ -902,7 +890,6 @@ pub fn executeMergeAction(
     };
     counts.relationship_kinds = database.changes();
 
-    // 3. publications
     database.exec(
         "INSERT OR IGNORE INTO main.publications (id, key, kind, title, created_at, updated_at) SELECT id, key, kind, title, created_at, updated_at FROM src.publications;",
     ) catch {
@@ -911,7 +898,6 @@ pub fn executeMergeAction(
     };
     counts.publications = database.changes();
 
-    // 4. relationships
     database.exec(
         "INSERT OR IGNORE INTO main.relationships (id, subject, object, kind, created_at) SELECT id, subject, object, kind, created_at FROM src.relationships;",
     ) catch {
@@ -920,7 +906,6 @@ pub fn executeMergeAction(
     };
     counts.relationships = database.changes();
 
-    // 5. notes
     database.exec(
         "INSERT OR IGNORE INTO main.notes (id, publication, body, created_at, updated_at) SELECT id, publication, body, created_at, updated_at FROM src.notes;",
     ) catch {
@@ -940,7 +925,7 @@ pub fn executeMergeAction(
         counts.publications,
         counts.relationships,
         counts.notes,
-    }) catch {};
+    }) catch return error.SqlFailed;
 }
 
 // ── Tests ──
