@@ -18,13 +18,6 @@ as a critical use case. It makes it easy to export references into a fresh datab
 Each version of `ken` comes with a schema migration that can be applied to any `ken` DB from an earlier release
 to make it compatible with the latest specification. We make the guarantee that these migrations will never fail.
 
-### Scoped help
-
-Every command and subcommand in `ken` responds to `-h`/`--help` with help text scoped to that specific
-command. `ken pubkind -h` shows help for `pubkind`. `ken pubkind list -h` shows help for `pubkind list`.
-This consistency makes `ken` discoverable for both humans and AI agents -- any level of the command
-hierarchy can be explored with `-h`.
-
 ### Multiple databases
 
 Researchers can maintain as many `ken` databases as they like — one per research interest, one per
@@ -107,3 +100,11 @@ data.
 follow when querying the database, and how to perform external lookups.
 
 The more formal and comprehensive the descriptions, the better.
+
+### Discoverability
+
+`ken` is designed for use by both humans and AI agents. To make its functionality discoverable
+without external documentation, every command and subcommand responds to `-h`/`--help` with help
+text scoped to that specific context. `ken -h` shows top-level help, `ken pubkind -h` shows help
+for `pubkind`, and `ken pubkind list -h` shows help for `pubkind list`. Any level of the command
+hierarchy can be explored this way.
