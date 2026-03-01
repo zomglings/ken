@@ -30,8 +30,8 @@ This information is in the `publication_kinds` table, which the following column
 2. `description`: a string column which holds descriptions about this kind of publication. This column should describe how publications
 of a given kind are keyed.
 
-`ken` ships with a default list of `publication_kinds`, but users may add their own kinds if they wish to. Custom
-`publication_kinds` could introduce merge conflicts in `ken` databases.
+`ken` ships with a default list of `publication_kinds` (`note`, `arxiv`, `video`, `web`, `topic`), but users may add
+their own kinds if they wish to. Custom `publication_kinds` could introduce merge conflicts in `ken` databases.
 
 #### Publications
 
@@ -64,8 +64,11 @@ allows for atomic merges (at least as far as the canonical kinds are concerned).
 #### Relationship kinds
 
 The `relationship_kinds` table defines the types of relationships that can exist between publications. It has the following columns:
-1. `name`: string primary key, e.g. `"cites"`, `"develops"`, `"duplicates"`, `"derives from"`.
+1. `name`: string primary key, e.g. `"cites"`, `"derives-from"`.
 2. `description`: string column which describes what the relationship kind represents, and how to interpret it.
+
+`ken` ships with two built-in relationship kinds: `cites` (subject cites object as a reference) and `derives-from`
+(subject is derived from or builds upon object). Users can add custom kinds via `ken relkind add`.
 
 Note that relationships in `ken` are directed by default. Each relationship has a `subject` and an `object`, as we will see below.
 
