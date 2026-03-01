@@ -133,57 +133,13 @@ pub const Db = struct {
         return error.StepFailed;
     }
 
-    /// Query all rows returning two text columns. Returns [][2][]const u8.
-    /// Caller must call freeRows2 to release memory.
-    pub fn queryRows2(self: *Db, allocator: std.mem.Allocator, sql: [*:0]const u8, params: []const ?[]const u8) (SqliteError || error{OutOfMemory})![][2][]const u8 {
+    /// Query all rows returning N text columns. Returns [][N][]const u8.
+    /// Caller must call freeRows to release memory.
+    pub fn queryRows(self: *Db, comptime N: usize, allocator: std.mem.Allocator, sql: [*:0]const u8, params: []const ?[]const u8) (SqliteError || error{OutOfMemory})![][N][]const u8 {
         const stmt = try self.prepareAndBind(sql, params);
         defer _ = c.sqlite3_finalize(stmt);
 
-        var rows: std.ArrayList([2][]const u8) = .empty;
-        errdefer {
-            for (rows.items) |row| {
-                allocator.free(row[0]);
-                allocator.free(row[1]);
-            }
-            rows.deinit(allocator);
-        }
-
-        while (true) {
-            const rc = c.sqlite3_step(stmt);
-            if (rc == c.SQLITE_DONE) break;
-            if (rc != c.SQLITE_ROW) return error.StepFailed;
-
-            const col0_ptr = c.sqlite3_column_text(stmt, 0);
-            const col0_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-            const col1_ptr = c.sqlite3_column_text(stmt, 1);
-            const col1_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
-
-            const s0 = if (col0_ptr != null) try allocator.dupe(u8, col0_ptr[0..col0_len]) else try allocator.dupe(u8, "");
-            errdefer allocator.free(s0);
-            const s1 = if (col1_ptr != null) try allocator.dupe(u8, col1_ptr[0..col1_len]) else try allocator.dupe(u8, "");
-
-            try rows.append(allocator, .{ s0, s1 });
-        }
-
-        return rows.toOwnedSlice(allocator);
-    }
-
-    /// Free rows returned by queryRows2.
-    pub fn freeRows2(allocator: std.mem.Allocator, rows: [][2][]const u8) void {
-        for (rows) |row| {
-            allocator.free(row[0]);
-            allocator.free(row[1]);
-        }
-        allocator.free(rows);
-    }
-
-    /// Query all rows returning four text columns. Returns [][4][]const u8.
-    /// Caller must call freeRows4 to release memory.
-    pub fn queryRows4(self: *Db, allocator: std.mem.Allocator, sql: [*:0]const u8, params: []const ?[]const u8) (SqliteError || error{OutOfMemory})![][4][]const u8 {
-        const stmt = try self.prepareAndBind(sql, params);
-        defer _ = c.sqlite3_finalize(stmt);
-
-        var rows: std.ArrayList([4][]const u8) = .empty;
+        var rows: std.ArrayList([N][]const u8) = .empty;
         errdefer {
             for (rows.items) |row| {
                 for (row) |col| allocator.free(col);
@@ -196,11 +152,11 @@ pub const Db = struct {
             if (rc == c.SQLITE_DONE) break;
             if (rc != c.SQLITE_ROW) return error.StepFailed;
 
-            var row: [4][]const u8 = undefined;
+            var row: [N][]const u8 = undefined;
             var ok: usize = 0;
             errdefer for (row[0..ok]) |col| allocator.free(col);
 
-            inline for (0..4) |col_i| {
+            inline for (0..N) |col_i| {
                 const ptr = c.sqlite3_column_text(stmt, col_i);
                 const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col_i));
                 row[col_i] = if (ptr != null) try allocator.dupe(u8, ptr[0..len]) else try allocator.dupe(u8, "");
@@ -213,8 +169,8 @@ pub const Db = struct {
         return rows.toOwnedSlice(allocator);
     }
 
-    /// Free rows returned by queryRows4.
-    pub fn freeRows4(allocator: std.mem.Allocator, rows: [][4][]const u8) void {
+    /// Free rows returned by queryRows.
+    pub fn freeRows(comptime N: usize, allocator: std.mem.Allocator, rows: [][N][]const u8) void {
         for (rows) |row| {
             for (row) |col| allocator.free(col);
         }
@@ -453,7 +409,7 @@ test "execParams: constraint violation on DELETE RESTRICT" {
     try testing.expectError(error.ConstraintViolation, result);
 }
 
-test "queryRows2: multi-row result" {
+test "queryRows: multi-row result" {
     var db = try Db.open(":memory:");
     defer db.close();
 
@@ -462,12 +418,13 @@ test "queryRows2: multi-row result" {
     try db.execParams("INSERT INTO items (name, description) VALUES (?1, ?2);", &.{ "alpha", "first" });
     try db.execParams("INSERT INTO items (name, description) VALUES (?1, ?2);", &.{ "beta", "second" });
 
-    const rows = try db.queryRows2(
+    const rows = try db.queryRows(
+        2,
         testing.allocator,
         "SELECT name, description FROM items ORDER BY name;",
         &.{},
     );
-    defer Db.freeRows2(testing.allocator, rows);
+    defer Db.freeRows(2, testing.allocator, rows);
 
     try testing.expectEqual(@as(usize, 2), rows.len);
     try testing.expectEqualStrings("alpha", rows[0][0]);
@@ -476,18 +433,19 @@ test "queryRows2: multi-row result" {
     try testing.expectEqualStrings("second", rows[1][1]);
 }
 
-test "queryRows2: empty result" {
+test "queryRows: empty result" {
     var db = try Db.open(":memory:");
     defer db.close();
 
     _ = try db.migrate(toy_migrations);
 
-    const rows = try db.queryRows2(
+    const rows = try db.queryRows(
+        2,
         testing.allocator,
         "SELECT name, description FROM items ORDER BY name;",
         &.{},
     );
-    defer Db.freeRows2(testing.allocator, rows);
+    defer Db.freeRows(2, testing.allocator, rows);
 
     try testing.expectEqual(@as(usize, 0), rows.len);
 }

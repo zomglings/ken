@@ -317,8 +317,8 @@ pub fn executeKindAction(
                 "SELECT name, description FROM {s} ORDER BY name LIMIT {d} OFFSET {d};",
                 .{ table, lim, off },
             ) catch unreachable;
-            const rows = database.queryRows2(allocator, sql, &.{}) catch return error.SqlFailed;
-            defer db.Db.freeRows2(allocator, rows);
+            const rows = database.queryRows(2, allocator, sql, &.{}) catch return error.SqlFailed;
+            defer db.Db.freeRows(2, allocator, rows);
             stdout.writeAll("[") catch return error.SqlFailed;
             for (rows, 0..) |row, idx| {
                 if (idx > 0) stdout.writeAll(",") catch return error.SqlFailed;
@@ -575,28 +575,18 @@ pub fn executeListAction(
 ) ListError!void {
     const lim: i64 = if (action.pagination.limit) |l| @intCast(l) else -1;
     const off: u32 = action.pagination.offset orelse 0;
+    const where = if (action.kind != null) " WHERE kind = ?1" else "";
 
-    if (action.kind) |kind| {
-        var sql_buf: [256]u8 = undefined;
-        const sql = std.fmt.bufPrintZ(
-            &sql_buf,
-            "SELECT id, kind, title, key FROM publications WHERE kind = ?1 ORDER BY created_at DESC LIMIT {d} OFFSET {d};",
-            .{ lim, off },
-        ) catch unreachable;
-        const rows = database.queryRows4(allocator, sql, &.{kind}) catch return error.SqlFailed;
-        defer db.Db.freeRows4(allocator, rows);
-        writePublicationRows(rows, stdout) catch return error.SqlFailed;
-    } else {
-        var sql_buf: [256]u8 = undefined;
-        const sql = std.fmt.bufPrintZ(
-            &sql_buf,
-            "SELECT id, kind, title, key FROM publications ORDER BY created_at DESC LIMIT {d} OFFSET {d};",
-            .{ lim, off },
-        ) catch unreachable;
-        const rows = database.queryRows4(allocator, sql, &.{}) catch return error.SqlFailed;
-        defer db.Db.freeRows4(allocator, rows);
-        writePublicationRows(rows, stdout) catch return error.SqlFailed;
-    }
+    var sql_buf: [256]u8 = undefined;
+    const sql = std.fmt.bufPrintZ(
+        &sql_buf,
+        "SELECT id, kind, title, key FROM publications{s} ORDER BY created_at DESC LIMIT {d} OFFSET {d};",
+        .{ where, lim, off },
+    ) catch unreachable;
+    const params: []const ?[]const u8 = if (action.kind) |k| &.{k} else &.{};
+    const rows = database.queryRows(4, allocator, sql, params) catch return error.SqlFailed;
+    defer db.Db.freeRows(4, allocator, rows);
+    writePublicationRows(rows, stdout) catch return error.SqlFailed;
 }
 
 fn writePublicationRows(rows: [][4][]const u8, stdout: anytype) !void {
