@@ -152,6 +152,18 @@ pub fn kindUsage(comptime entity: KindEntity) []const u8 {
         "  update <name> [--name N] [--description D] Update a " ++ lbl ++ "\n";
 }
 
+pub fn kindSubcommandUsage(comptime entity: KindEntity, comptime sub: KindSubcommand) []const u8 {
+    const ent = @tagName(entity);
+    const lbl = entity.label();
+    return switch (sub) {
+        .show => "Usage: ken " ++ ent ++ " show <name>\n\nShow a " ++ lbl ++ " by name. Prints JSON with name and description.\n",
+        .list => "Usage: ken " ++ ent ++ " list [--limit N] [--offset N] [--descriptions]\n\nList " ++ lbl ++ "s as a JSON array.\n\nOptions:\n  --limit N        Maximum number of results\n  --offset N       Skip first N results\n  --descriptions   Include descriptions in output\n",
+        .add => "Usage: ken " ++ ent ++ " add <name> <description>\n\nAdd a new " ++ lbl ++ ".\n",
+        .remove => "Usage: ken " ++ ent ++ " remove <name>\n\nRemove a " ++ lbl ++ ". Fails if the kind is in use.\n",
+        .update => "Usage: ken " ++ ent ++ " update <name> [--name N] [--description D]\n\nUpdate a " ++ lbl ++ ". At least one of --name or --description is required.\n",
+    };
+}
+
 /// Parses arguments for a `pubkind` or `relkind` command group.
 /// `args` is the full argv slice; `cmd_index` is the index of the entity command
 /// (e.g. 1 for "pubkind" in `ken pubkind show book`).

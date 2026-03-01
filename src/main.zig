@@ -107,11 +107,19 @@ pub fn main(process: std.process.Init) !void {
         return;
     };
 
-    // Unified help flag check — applies to all commands
-    if (hasHelpFlag(args[2..])) {
-        try printCommandUsage(cmd, stdout);
-        try stdout.flush();
-        return;
+    // Help flag check for commands without their own argument parsers.
+    // Commands with subcommands (pubkind, relkind) and commands with their
+    // own parsers (add) handle -h internally so help is scoped to the
+    // specific subcommand being asked about.
+    switch (cmd) {
+        .pubkind, .relkind, .add => {},
+        else => {
+            if (hasHelpFlag(args[2..])) {
+                try printCommandUsage(cmd, stdout);
+                try stdout.flush();
+                return;
+            }
+        },
     }
 
     switch (cmd) {
@@ -195,6 +203,11 @@ pub fn main(process: std.process.Init) !void {
         },
         .add => {
             const action = ken.parseAddArgs(args, 1) catch |err| {
+                if (err == error.HelpRequested) {
+                    try stdout.writeAll(ken.addUsage);
+                    try stdout.flush();
+                    return;
+                }
                 switch (err) {
                     error.MissingArgument => try stderr.print("Error: missing argument. Usage: ken add <kind> [-k/--key <key>] [--title <title>]\n", .{}),
                     error.UnknownFlag => try stderr.print("Error: unknown flag. Usage: ken add <kind> [-k/--key <key>] [--title <title>]\n", .{}),
@@ -274,6 +287,22 @@ pub fn main(process: std.process.Init) !void {
         inline .pubkind, .relkind => |tag| {
             const entity = comptime std.meta.stringToEnum(ken.KindEntity, @tagName(tag)).?;
             const action = ken.parseKindArgs(args, 1) catch |err| {
+                if (err == error.HelpRequested) {
+                    // Show subcommand-specific help if a valid subcommand was given,
+                    // otherwise show command-level help.
+                    if (args.len > 2) {
+                        if (std.meta.stringToEnum(ken.KindSubcommand, args[2])) |sub| {
+                            switch (sub) {
+                                inline else => |s| try stdout.writeAll(comptime ken.kindSubcommandUsage(entity, s)),
+                            }
+                            try stdout.flush();
+                            return;
+                        }
+                    }
+                    try stdout.writeAll(ken.kindUsage(entity));
+                    try stdout.flush();
+                    return;
+                }
                 try ken.formatKindError(entity, err, stderr);
                 try stderr.flush();
                 return;
