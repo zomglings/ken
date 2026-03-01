@@ -164,6 +164,23 @@ pub fn kindSubcommandUsage(comptime entity: KindEntity, comptime sub: KindSubcom
     };
 }
 
+/// Write the appropriate help text for a kind command. Shows subcommand-specific
+/// help if args contain a valid subcommand, otherwise shows command-level help.
+/// Uses cmd_index to locate the subcommand, keeping position logic co-located
+/// with parseKindArgs.
+pub fn writeKindHelp(comptime entity: KindEntity, args: []const [:0]const u8, cmd_index: usize, stdout: anytype) !void {
+    const sub_index = cmd_index + 1;
+    if (args.len > sub_index) {
+        if (std.meta.stringToEnum(KindSubcommand, args[sub_index])) |sub| {
+            switch (sub) {
+                inline else => |s| try stdout.writeAll(comptime kindSubcommandUsage(entity, s)),
+            }
+            return;
+        }
+    }
+    try stdout.writeAll(kindUsage(entity));
+}
+
 /// Parses arguments for a `pubkind` or `relkind` command group.
 /// `args` is the full argv slice; `cmd_index` is the index of the entity command
 /// (e.g. 1 for "pubkind" in `ken pubkind show book`).

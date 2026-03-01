@@ -288,18 +288,7 @@ pub fn main(process: std.process.Init) !void {
             const entity = comptime std.meta.stringToEnum(ken.KindEntity, @tagName(tag)).?;
             const action = ken.parseKindArgs(args, 1) catch |err| {
                 if (err == error.HelpRequested) {
-                    // Show subcommand-specific help if a valid subcommand was given,
-                    // otherwise show command-level help.
-                    if (args.len > 2) {
-                        if (std.meta.stringToEnum(ken.KindSubcommand, args[2])) |sub| {
-                            switch (sub) {
-                                inline else => |s| try stdout.writeAll(comptime ken.kindSubcommandUsage(entity, s)),
-                            }
-                            try stdout.flush();
-                            return;
-                        }
-                    }
-                    try stdout.writeAll(ken.kindUsage(entity));
+                    try ken.writeKindHelp(entity, args, 1, stdout);
                     try stdout.flush();
                     return;
                 }
