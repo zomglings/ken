@@ -142,8 +142,10 @@ pub fn isHelpFlag(arg: []const u8) bool {
 
 pub fn kindUsage(comptime entity: KindEntity) []const u8 {
     const lbl = comptime entity.label();
-    return "Usage: ken " ++ @tagName(entity) ++ " <subcommand> [options]\n" ++
+    return "Usage: ken [-D <path>] " ++ @tagName(entity) ++ " <subcommand> [options]\n" ++
         "\nManage " ++ lbl ++ "s.\n" ++
+        "\nOptions:\n" ++
+        "  -D, --db <path>  Path to ken database (default: platform-specific)\n" ++
         "\nSubcommands:\n" ++
         "  show <name>                                Show a " ++ lbl ++ "\n" ++
         "  list [--limit N] [--offset N] [--descriptions] List " ++ lbl ++ "s\n" ++
@@ -156,11 +158,11 @@ pub fn kindSubcommandUsage(comptime entity: KindEntity, comptime sub: KindSubcom
     const ent = @tagName(entity);
     const lbl = entity.label();
     return switch (sub) {
-        .show => "Usage: ken " ++ ent ++ " show <name>\n\nShow a " ++ lbl ++ " by name. Prints JSON with name and description.\n",
-        .list => "Usage: ken " ++ ent ++ " list [--limit N] [--offset N] [--descriptions]\n\nList " ++ lbl ++ "s as a JSON array.\n\nOptions:\n  --limit N        Maximum number of results\n  --offset N       Skip first N results\n  --descriptions   Include descriptions in output\n",
-        .add => "Usage: ken " ++ ent ++ " add <name> <description>\n\nAdd a new " ++ lbl ++ ".\n",
-        .remove => "Usage: ken " ++ ent ++ " remove <name>\n\nRemove a " ++ lbl ++ ". Fails if the kind is in use.\n",
-        .update => "Usage: ken " ++ ent ++ " update <name> [--name N] [--description D]\n\nUpdate a " ++ lbl ++ ". At least one of --name or --description is required.\n",
+        .show => "Usage: ken [-D <path>] " ++ ent ++ " show <name>\n\nShow a " ++ lbl ++ " by name. Prints JSON with name and description.\n\nOptions:\n  -D, --db <path>  Path to ken database (default: platform-specific)\n",
+        .list => "Usage: ken [-D <path>] " ++ ent ++ " list [--limit N] [--offset N] [--descriptions]\n\nList " ++ lbl ++ "s as a JSON array.\n\nOptions:\n  -D, --db <path>  Path to ken database (default: platform-specific)\n  --limit N        Maximum number of results\n  --offset N       Skip first N results\n  --descriptions   Include descriptions in output\n",
+        .add => "Usage: ken [-D <path>] " ++ ent ++ " add <name> <description>\n\nAdd a new " ++ lbl ++ ".\n\nOptions:\n  -D, --db <path>  Path to ken database (default: platform-specific)\n",
+        .remove => "Usage: ken [-D <path>] " ++ ent ++ " remove <name>\n\nRemove a " ++ lbl ++ ". Fails if the kind is in use.\n\nOptions:\n  -D, --db <path>  Path to ken database (default: platform-specific)\n",
+        .update => "Usage: ken [-D <path>] " ++ ent ++ " update <name> [--name N] [--description D]\n\nUpdate a " ++ lbl ++ ". At least one of --name or --description is required.\n\nOptions:\n  -D, --db <path>  Path to ken database (default: platform-specific)\n",
     };
 }
 
@@ -434,9 +436,12 @@ pub fn executeKindAction(
 }
 
 pub const addUsage =
-    \\Usage: ken add <kind> [-k/--key <key>] [--title <title>]
+    \\Usage: ken [-D <path>] add <kind> [-k/--key <key>] [--title <title>]
     \\
     \\Add a publication to the database.
+    \\
+    \\Options:
+    \\  -D, --db <path>  Path to ken database (default: platform-specific)
     \\
     \\Arguments:
     \\  <kind>           Publication kind (e.g. note, arxiv, video, web)

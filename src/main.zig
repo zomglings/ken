@@ -3,10 +3,10 @@ const ken = @import("ken");
 const Io = std.Io;
 
 const usage =
-    \\Usage: ken [-d <path>] <command> [options]
+    \\Usage: ken [-D <path>] <command> [options]
     \\
     \\Options:
-    \\  -d, --db <path>  Path to ken database (default: platform-specific)
+    \\  -D, --db <path>  Path to ken database (default: platform-specific)
     \\
     \\Commands:
     \\  version    Print ken version
@@ -44,9 +44,9 @@ const Command = enum {
 fn printCommandUsage(cmd: Command, stdout: anytype) !void {
     switch (cmd) {
         .version => try stdout.writeAll("Usage: ken version\n\nPrint ken version.\n"),
-        .init => try stdout.writeAll("Usage: ken [-d <path>] init\n\nCreate or upgrade a ken database.\nIf -d is not given, uses the default location.\n"),
+        .init => try stdout.writeAll("Usage: ken [-D <path>] init\n\nCreate or upgrade a ken database.\nIf -D is not given, uses the default location.\n"),
         .initpath => try stdout.writeAll("Usage: ken initpath\n\nPrint the default database path for this platform.\n"),
-        .dbversion => try stdout.writeAll("Usage: ken [-d <path>] dbversion\n\nPrint schema version of a ken database.\nIf -d is not given, uses the default location.\n"),
+        .dbversion => try stdout.writeAll("Usage: ken [-D <path>] dbversion\n\nPrint schema version of a ken database.\nIf -D is not given, uses the default location.\n"),
         .add => try stdout.writeAll(ken.addUsage),
         .pubkind => try stdout.writeAll(ken.kindUsage(.pubkind)),
         .relkind => try stdout.writeAll(ken.kindUsage(.relkind)),
@@ -67,17 +67,17 @@ pub fn main(process: std.process.Init) !void {
     var stderr_writer: Io.File.Writer = .init(.stderr(), process.io, &stderr_buf);
     const stderr = &stderr_writer.interface;
 
-    // Extract -d/--db from args and build filtered args
+    // Extract -D/--db from args and build filtered args
     var explicit_db_path: ?[:0]const u8 = null;
     var filtered: std.ArrayList([:0]const u8) = .empty;
     {
         var i: usize = 0;
         while (i < raw_args.len) : (i += 1) {
             const arg: []const u8 = raw_args[i];
-            if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--db")) {
+            if (std.mem.eql(u8, arg, "-D") or std.mem.eql(u8, arg, "--db")) {
                 i += 1;
                 if (i >= raw_args.len) {
-                    try stderr.print("Error: -d/--db requires a path argument\n", .{});
+                    try stderr.print("Error: -D/--db requires a path argument\n", .{});
                     try stderr.flush();
                     return;
                 }

@@ -25,6 +25,13 @@ command. `ken pubkind -h` shows help for `pubkind`. `ken pubkind list -h` shows 
 This consistency makes `ken` discoverable for both humans and AI agents -- any level of the command
 hierarchy can be explored with `-h`.
 
+### Multiple databases
+
+Researchers can maintain as many `ken` databases as they like — one per research interest, one per
+AI agent, or any other scheme. Every command that operates on a database accepts `-D/--db <path>`
+to target a specific database. If omitted, the default platform-specific path is used
+(e.g. `~/Library/Application Support/ken/ken.db` on macOS).
+
 ### Database schema
 
 #### Publication kinds
