@@ -17,6 +17,7 @@ const usage =
     \\  add        Add a publication
     \\  relate     Create a relationship between publications
     \\  list       List publications
+    \\  load       Load publications from a JSON file
     \\  merge      Merge two ken databases
     \\  skill      Generate agent skills
     \\  pubkind    Manage publication kinds
@@ -33,6 +34,7 @@ const Command = enum {
     add,
     relate,
     list,
+    load,
     merge,
     skill,
     pubkind,
@@ -49,6 +51,7 @@ fn printCommandUsage(cmd: Command, stdout: anytype) !void {
         .add => try stdout.writeAll(ken.addUsage),
         .relate => try stdout.writeAll(ken.relateUsage),
         .list => try stdout.writeAll(ken.listUsage),
+        .load => try stdout.writeAll(ken.loadUsage),
         .pubkind => try stdout.writeAll(ken.kindUsage(.pubkind)),
         .relkind => try stdout.writeAll(ken.kindUsage(.relkind)),
         .merge => try stdout.writeAll(ken.mergeUsage),
@@ -114,7 +117,7 @@ pub fn main(process: std.process.Init) !void {
     // own parsers (add) handle -h internally so help is scoped to the
     // specific subcommand being asked about.
     switch (cmd) {
-        .pubkind, .relkind, .add, .relate, .list, .merge => {},
+        .pubkind, .relkind, .add, .relate, .list, .load, .merge => {},
         else => {
             if (hasHelpFlag(args[2..])) {
                 try printCommandUsage(cmd, stdout);
@@ -397,6 +400,78 @@ pub fn main(process: std.process.Init) !void {
 
             ken.executeListAction(&database, arena, action, stdout) catch {
                 try stderr.print("Error: could not list publications\n", .{});
+                try stderr.flush();
+                return;
+            };
+            try stdout.flush();
+        },
+        .load => {
+            const action = ken.parseLoadArgs(args, 1) catch |err| {
+                if (err == error.HelpRequested) {
+                    try stdout.writeAll(ken.loadUsage);
+                    try stdout.flush();
+                    return;
+                }
+                switch (err) {
+                    error.MissingArgument => try stderr.print("Error: missing file path. Usage: ken load <file>\n", .{}),
+                    error.UnknownFlag => try stderr.print("Error: unexpected argument. Usage: ken load <file>\n", .{}),
+                    else => try stderr.print("Error: invalid arguments for 'load'\n", .{}),
+                }
+                try stderr.flush();
+                return;
+            };
+
+            // Read file
+            const max_load_size = 50 * 1024 * 1024; // 50 MB
+            const file_content = blk: {
+                const file = Io.Dir.openFile(.cwd(), process.io, action.file_path, .{}) catch {
+                    try stderr.print("Error: could not open file '{s}'\n", .{action.file_path});
+                    try stderr.flush();
+                    return;
+                };
+                defer file.close(process.io);
+                const stat = file.stat(process.io) catch {
+                    try stderr.print("Error: could not stat file '{s}'\n", .{action.file_path});
+                    try stderr.flush();
+                    return;
+                };
+                const size: usize = @intCast(stat.size);
+                if (size == 0) {
+                    try stderr.print("Error: file is empty\n", .{});
+                    try stderr.flush();
+                    return;
+                }
+                if (size > max_load_size) {
+                    try stderr.print("Error: file exceeds 50 MB limit\n", .{});
+                    try stderr.flush();
+                    return;
+                }
+                const buf = arena.alloc(u8, size) catch {
+                    try stderr.print("Error: out of memory\n", .{});
+                    try stderr.flush();
+                    return;
+                };
+                const n = file.readPositionalAll(process.io, buf, 0) catch {
+                    try stderr.print("Error: could not read file '{s}'\n", .{action.file_path});
+                    try stderr.flush();
+                    return;
+                };
+                break :blk buf[0..n];
+            };
+
+            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
+            var database = ken.db.Db.open(db_path) catch {
+                try stderr.print("Error: could not open database '{s}'\n", .{db_path});
+                try stderr.flush();
+                return;
+            };
+            defer database.close();
+
+            var seed_bytes: [8]u8 = undefined;
+            process.io.random(&seed_bytes);
+            var prng = std.Random.Pcg.init(@bitCast(seed_bytes));
+
+            ken.executeLoadAction(&database, arena, file_content, prng.random(), stdout, stderr) catch {
                 try stderr.flush();
                 return;
             };
