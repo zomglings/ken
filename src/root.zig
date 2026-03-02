@@ -1243,7 +1243,6 @@ pub fn executeLoadAction(
     stdout.writeAll("}}\n") catch return error.SqlFailed;
 }
 
-
 // ── Skill ──
 
 pub const skillUsage =
