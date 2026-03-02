@@ -1070,17 +1070,21 @@ pub fn executeLoadAction(
     const rels = load.relationships orelse &.{};
     const notes = load.notes orelse &.{};
 
-    // Check for duplicate refs.
+    // Build ref→index map and check for duplicate refs.
+    var ref_map = std.StringHashMap(usize).init(allocator);
+    defer ref_map.deinit();
     var has_dup = false;
     for (pubs, 0..) |p, i| {
         if (p.ref) |ref| {
-            for (pubs[0..i]) |prev| {
-                if (prev.ref) |prev_ref| {
-                    if (std.mem.eql(u8, ref, prev_ref)) {
-                        stderr.print("Error: duplicate ref '{s}'\n", .{ref}) catch {};
-                        has_dup = true;
-                    }
-                }
+            const gop = ref_map.getOrPut(ref) catch {
+                stderr.print("Error: out of memory\n", .{}) catch {};
+                return error.SqlFailed;
+            };
+            if (gop.found_existing) {
+                stderr.print("Error: duplicate ref '{s}'\n", .{ref}) catch {};
+                has_dup = true;
+            } else {
+                gop.value_ptr.* = i;
             }
         }
     }
@@ -1090,14 +1094,14 @@ pub fn executeLoadAction(
     var has_unresolved = false;
     for (rels) |rel| {
         for ([_][]const u8{ rel.subject, rel.object }) |ref| {
-            if (!refExists(pubs, ref) and !looksLikeUuid(ref)) {
+            if (!ref_map.contains(ref) and !looksLikeUuid(ref)) {
                 stderr.print("Error: unresolved reference '{s}'\n", .{ref}) catch {};
                 has_unresolved = true;
             }
         }
     }
     for (notes) |note| {
-        if (!refExists(pubs, note.publication) and !looksLikeUuid(note.publication)) {
+        if (!ref_map.contains(note.publication) and !looksLikeUuid(note.publication)) {
             stderr.print("Error: unresolved reference '{s}'\n", .{note.publication}) catch {};
             has_unresolved = true;
         }
@@ -1177,8 +1181,8 @@ pub fn executeLoadAction(
 
     // INSERT relationships
     for (rels) |rel| {
-        const subject_uuid = resolveRef(pubs, uuids, rel.subject) orelse rel.subject;
-        const object_uuid = resolveRef(pubs, uuids, rel.object) orelse rel.object;
+        const subject_uuid: []const u8 = if (ref_map.get(rel.subject)) |i| &uuids[i] else rel.subject;
+        const object_uuid: []const u8 = if (ref_map.get(rel.object)) |i| &uuids[i] else rel.object;
 
         var rel_rand: [16]u8 = undefined;
         rand.bytes(&rel_rand);
@@ -1196,7 +1200,7 @@ pub fn executeLoadAction(
 
     // INSERT notes
     for (notes) |note| {
-        const pub_uuid = resolveRef(pubs, uuids, note.publication) orelse note.publication;
+        const pub_uuid: []const u8 = if (ref_map.get(note.publication)) |i| &uuids[i] else note.publication;
 
         var note_rand: [16]u8 = undefined;
         rand.bytes(&note_rand);
@@ -1239,24 +1243,6 @@ pub fn executeLoadAction(
     stdout.writeAll("}}\n") catch return error.SqlFailed;
 }
 
-/// Find the index of a ref label in the publications array.
-fn findRefIndex(pubs: []const LoadPublication, ref: []const u8) ?usize {
-    for (pubs, 0..) |p, i| {
-        if (p.ref) |r| {
-            if (std.mem.eql(u8, ref, r)) return i;
-        }
-    }
-    return null;
-}
-
-fn refExists(pubs: []const LoadPublication, ref: []const u8) bool {
-    return findRefIndex(pubs, ref) != null;
-}
-
-fn resolveRef(pubs: []const LoadPublication, uuids: []const [36]u8, ref: []const u8) ?[]const u8 {
-    const i = findRefIndex(pubs, ref) orelse return null;
-    return &uuids[i];
-}
 
 // ── Skill ──
 
