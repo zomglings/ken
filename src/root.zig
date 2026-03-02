@@ -1093,24 +1093,14 @@ pub fn executeLoadAction(
     var has_unresolved = false;
     for (rels) |rel| {
         for ([_][]const u8{ rel.subject, rel.object }) |ref| {
-            const in_refs = for (pubs) |p| {
-                if (p.ref) |r| {
-                    if (std.mem.eql(u8, ref, r)) break true;
-                }
-            } else false;
-            if (!in_refs and !looksLikeUuid(ref)) {
+            if (!refExists(pubs, ref) and !looksLikeUuid(ref)) {
                 stderr.print("Error: unresolved reference '{s}'\n", .{ref}) catch {};
                 has_unresolved = true;
             }
         }
     }
     for (notes) |note| {
-        const in_refs = for (pubs) |p| {
-            if (p.ref) |r| {
-                if (std.mem.eql(u8, note.publication, r)) break true;
-            }
-        } else false;
-        if (!in_refs and !looksLikeUuid(note.publication)) {
+        if (!refExists(pubs, note.publication) and !looksLikeUuid(note.publication)) {
             stderr.print("Error: unresolved reference '{s}'\n", .{note.publication}) catch {};
             has_unresolved = true;
         }
@@ -1124,9 +1114,14 @@ pub fn executeLoadAction(
     };
     errdefer database.exec("ROLLBACK;") catch {};
 
-    // Validate all publication kinds exist
+    // Validate all publication kinds exist (deduplicated)
     var has_missing = false;
-    for (pubs) |p| {
+    for (pubs, 0..) |p, pi| {
+        const already_checked = for (pubs[0..pi]) |prev| {
+            if (std.mem.eql(u8, prev.kind, p.kind)) break true;
+        } else false;
+        if (already_checked) continue;
+
         const exists = database.exists(
             "SELECT 1 FROM publication_kinds WHERE name = ?1;",
             &.{p.kind},
@@ -1140,8 +1135,13 @@ pub fn executeLoadAction(
         }
     }
 
-    // Validate all relationship kinds exist
-    for (rels) |rel| {
+    // Validate all relationship kinds exist (deduplicated)
+    for (rels, 0..) |rel, ri| {
+        const already_checked = for (rels[0..ri]) |prev| {
+            if (std.mem.eql(u8, prev.kind, rel.kind)) break true;
+        } else false;
+        if (already_checked) continue;
+
         const exists = database.exists(
             "SELECT 1 FROM relationship_kinds WHERE name = ?1;",
             &.{rel.kind},
@@ -1179,7 +1179,6 @@ pub fn executeLoadAction(
     }
 
     // INSERT relationships
-    var rel_count: u32 = 0;
     for (rels) |rel| {
         const subject_uuid = resolveRef(pubs, uuids, rel.subject) orelse rel.subject;
         const object_uuid = resolveRef(pubs, uuids, rel.object) orelse rel.object;
@@ -1196,11 +1195,9 @@ pub fn executeLoadAction(
             stderr.print("Error: could not insert relationship\n", .{}) catch {};
             return error.SqlFailed;
         };
-        rel_count += 1;
     }
 
     // INSERT notes
-    var note_count: u32 = 0;
     for (notes) |note| {
         const pub_uuid = resolveRef(pubs, uuids, note.publication) orelse note.publication;
 
@@ -1216,7 +1213,6 @@ pub fn executeLoadAction(
             stderr.print("Error: could not insert note\n", .{}) catch {};
             return error.SqlFailed;
         };
-        note_count += 1;
     }
 
     // COMMIT
@@ -1228,8 +1224,8 @@ pub fn executeLoadAction(
     // Write output JSON
     stdout.print("{{\"publications\":{d},\"relationships\":{d},\"notes\":{d},\"refs\":{{", .{
         pubs.len,
-        rel_count,
-        note_count,
+        rels.len,
+        notes.len,
     }) catch return error.SqlFailed;
 
     var first = true;
@@ -1244,6 +1240,15 @@ pub fn executeLoadAction(
     }
 
     stdout.writeAll("}}\n") catch return error.SqlFailed;
+}
+
+/// Check if a ref label exists in the publications array.
+fn refExists(pubs: []const LoadPublication, ref: []const u8) bool {
+    return for (pubs) |p| {
+        if (p.ref) |r| {
+            if (std.mem.eql(u8, ref, r)) break true;
+        }
+    } else false;
 }
 
 /// Resolve a reference string: check if it matches any publication ref,
@@ -2259,11 +2264,6 @@ test "load: extra arg is error" {
 }
 
 // ── executeLoadAction tests ──
-
-fn testRandom() std.Random {
-    var prng = std.Random.Pcg.init(42);
-    return prng.random();
-}
 
 test "executeLoadAction: empty object is no-op" {
     var database = try testDb();

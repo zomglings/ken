@@ -468,11 +468,9 @@ pub fn main(process: std.process.Init) !void {
             };
             defer database.close();
 
-            var rand_bytes: [16]u8 = undefined;
-            process.io.random(&rand_bytes);
-            // Use the random bytes to seed a PRNG for generating multiple UUIDs
-            const seed: u64 = @bitCast(rand_bytes[0..8].*);
-            var prng = std.Random.Pcg.init(seed);
+            var seed_bytes: [8]u8 = undefined;
+            process.io.random(&seed_bytes);
+            var prng = std.Random.Pcg.init(@bitCast(seed_bytes));
 
             ken.executeLoadAction(&database, arena, file_content, prng.random(), stdout, stderr) catch {
                 try stderr.flush();
