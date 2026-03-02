@@ -5,7 +5,7 @@ const builtin = @import("builtin");
 pub const db = @import("db.zig");
 const encodeJsonString = std.json.Stringify.encodeJsonString;
 
-pub const version: u32 = 0;
+pub const version: u32 = 1;
 pub const default_db_name = "ken.db";
 
 /// Human-readable default database path for help text, resolved at comptime.
@@ -90,6 +90,8 @@ pub const migrations: []const [*:0]const u8 = &.{
     \\INSERT INTO relationship_kinds (name, description) VALUES ('cites', 'Subject cites object as a reference or source.');
     \\INSERT INTO relationship_kinds (name, description) VALUES ('derives-from', 'Subject is derived from or builds upon object.');
     ,
+    // Version 1: no schema changes (ken load uses existing tables).
+    "SELECT 1;",
 };
 
 pub const KindEntity = enum {
@@ -948,6 +950,313 @@ pub fn executeMergeAction(
     }) catch return error.SqlFailed;
 }
 
+// ── Load ──
+
+const LoadPublication = struct {
+    ref: ?[]const u8 = null,
+    kind: []const u8,
+    key: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+};
+
+const LoadRelationship = struct {
+    subject: []const u8,
+    object: []const u8,
+    kind: []const u8,
+};
+
+const LoadNote = struct {
+    publication: []const u8,
+    body: []const u8,
+};
+
+const LoadData = struct {
+    publications: ?[]const LoadPublication = null,
+    relationships: ?[]const LoadRelationship = null,
+    notes: ?[]const LoadNote = null,
+};
+
+pub const LoadAction = struct {
+    file_path: []const u8,
+};
+
+pub const loadUsage =
+    \\Usage: ken [-D <path>] load <file>
+    \\
+    \\Load publications, relationships, and notes from a JSON file.
+    \\Everything is inserted in a single transaction.
+    \\
+    \\Options:
+    \\
+++ db_flag_help ++
+    \\
+    \\JSON format:
+    \\  {
+    \\    "publications": [
+    \\      {"ref": "p1", "kind": "arxiv", "key": "2301.07041", "title": "Paper A"},
+    \\      {"ref": "t1", "kind": "topic", "title": "Scaling Laws"}
+    \\    ],
+    \\    "relationships": [
+    \\      {"subject": "p1", "object": "t1", "kind": "derives-from"}
+    \\    ],
+    \\    "notes": [
+    \\      {"publication": "p1", "body": "Important paper about..."}
+    \\    ]
+    \\  }
+    \\
+    \\All three arrays are optional. "ref" on publications is optional — only
+    \\needed when referenced elsewhere in the file. In relationships and notes,
+    \\subject/object/publication resolves first as a ref label, then as a UUID
+    \\of an existing DB entry. All referenced kinds must already exist.
+    \\
+    \\Output JSON: {"publications":N,"relationships":N,"notes":N,"refs":{...}}
+    \\The refs map gives the generated UUID for every labelled publication.
+    \\
+;
+
+pub fn parseLoadArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!LoadAction {
+    const rest = args[cmd_index + 1 ..];
+
+    var file_path: ?[]const u8 = null;
+    for (rest) |arg| {
+        const a: []const u8 = arg;
+        if (isHelpFlag(a)) return error.HelpRequested;
+        if (file_path != null) return error.UnknownFlag;
+        file_path = a;
+    }
+    if (file_path == null) return error.MissingArgument;
+    return .{ .file_path = file_path.? };
+}
+
+pub const LoadError = error{
+    SqlFailed,
+    InvalidJson,
+    DuplicateRef,
+    UnresolvedRef,
+    MissingKind,
+};
+
+/// Check if a string looks like a UUID (8-4-4-4-12 hex pattern).
+fn looksLikeUuid(s: []const u8) bool {
+    if (s.len != 36) return false;
+    for (s, 0..) |ch, i| {
+        if (i == 8 or i == 13 or i == 18 or i == 23) {
+            if (ch != '-') return false;
+        } else {
+            if (!std.ascii.isHex(ch)) return false;
+        }
+    }
+    return true;
+}
+
+pub fn executeLoadAction(
+    database: *db.Db,
+    allocator: std.mem.Allocator,
+    file_content: []const u8,
+    rand: std.Random,
+    stdout: anytype,
+    stderr: anytype,
+) LoadError!void {
+    // Parse JSON
+    const data = std.json.parseFromSlice(LoadData, allocator, file_content, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        stderr.print("Error: invalid JSON\n", .{}) catch {};
+        return error.InvalidJson;
+    };
+    defer data.deinit();
+    const load = data.value;
+
+    const pubs = load.publications orelse &.{};
+    const rels = load.relationships orelse &.{};
+    const notes = load.notes orelse &.{};
+
+    // Build ref_map: ref string → index in pubs array
+    // Use a simple linear scan since publication counts are modest.
+    // Check for duplicate refs.
+    var has_dup = false;
+    for (pubs, 0..) |p, i| {
+        if (p.ref) |ref| {
+            for (pubs[0..i]) |prev| {
+                if (prev.ref) |prev_ref| {
+                    if (std.mem.eql(u8, ref, prev_ref)) {
+                        stderr.print("Error: duplicate ref '{s}'\n", .{ref}) catch {};
+                        has_dup = true;
+                    }
+                }
+            }
+        }
+    }
+    if (has_dup) return error.DuplicateRef;
+
+    // Validate all references in relationships/notes resolve
+    var has_unresolved = false;
+    for (rels) |rel| {
+        for ([_][]const u8{ rel.subject, rel.object }) |ref| {
+            const in_refs = for (pubs) |p| {
+                if (p.ref) |r| {
+                    if (std.mem.eql(u8, ref, r)) break true;
+                }
+            } else false;
+            if (!in_refs and !looksLikeUuid(ref)) {
+                stderr.print("Error: unresolved reference '{s}'\n", .{ref}) catch {};
+                has_unresolved = true;
+            }
+        }
+    }
+    for (notes) |note| {
+        const in_refs = for (pubs) |p| {
+            if (p.ref) |r| {
+                if (std.mem.eql(u8, note.publication, r)) break true;
+            }
+        } else false;
+        if (!in_refs and !looksLikeUuid(note.publication)) {
+            stderr.print("Error: unresolved reference '{s}'\n", .{note.publication}) catch {};
+            has_unresolved = true;
+        }
+    }
+    if (has_unresolved) return error.UnresolvedRef;
+
+    // BEGIN IMMEDIATE
+    database.exec("BEGIN IMMEDIATE;") catch {
+        stderr.print("Error: could not begin transaction\n", .{}) catch {};
+        return error.SqlFailed;
+    };
+    errdefer database.exec("ROLLBACK;") catch {};
+
+    // Validate all publication kinds exist
+    var has_missing = false;
+    for (pubs) |p| {
+        const exists = database.exists(
+            "SELECT 1 FROM publication_kinds WHERE name = ?1;",
+            &.{p.kind},
+        ) catch {
+            stderr.print("Error: could not query database\n", .{}) catch {};
+            return error.SqlFailed;
+        };
+        if (!exists) {
+            stderr.print("Error: unknown publication kind '{s}'\n", .{p.kind}) catch {};
+            has_missing = true;
+        }
+    }
+
+    // Validate all relationship kinds exist
+    for (rels) |rel| {
+        const exists = database.exists(
+            "SELECT 1 FROM relationship_kinds WHERE name = ?1;",
+            &.{rel.kind},
+        ) catch {
+            stderr.print("Error: could not query database\n", .{}) catch {};
+            return error.SqlFailed;
+        };
+        if (!exists) {
+            stderr.print("Error: unknown relationship kind '{s}'\n", .{rel.kind}) catch {};
+            has_missing = true;
+        }
+    }
+    if (has_missing) return error.MissingKind;
+
+    // Generate UUIDs and INSERT publications. Build ref_to_uuid map.
+    // Store all generated UUIDs in an array parallel to pubs.
+    const uuids = allocator.alloc([36]u8, pubs.len) catch {
+        stderr.print("Error: out of memory\n", .{}) catch {};
+        return error.SqlFailed;
+    };
+    defer allocator.free(uuids);
+
+    for (pubs, 0..) |p, i| {
+        var rand_bytes: [16]u8 = undefined;
+        rand.bytes(&rand_bytes);
+        uuidV4(&uuids[i], &rand_bytes);
+
+        database.execParams(
+            "INSERT INTO publications (id, key, kind, title) VALUES (?1, ?2, ?3, ?4);",
+            &.{ &uuids[i], p.key, p.kind, p.title },
+        ) catch {
+            stderr.print("Error: could not insert publication\n", .{}) catch {};
+            return error.SqlFailed;
+        };
+    }
+
+    // INSERT relationships
+    var rel_count: u32 = 0;
+    for (rels) |rel| {
+        const subject_uuid = resolveRef(pubs, uuids, rel.subject) orelse rel.subject;
+        const object_uuid = resolveRef(pubs, uuids, rel.object) orelse rel.object;
+
+        var rel_rand: [16]u8 = undefined;
+        rand.bytes(&rel_rand);
+        var rel_uuid: [36]u8 = undefined;
+        uuidV4(&rel_uuid, &rel_rand);
+
+        database.execParams(
+            "INSERT INTO relationships (id, subject, object, kind) VALUES (?1, ?2, ?3, ?4);",
+            &.{ &rel_uuid, subject_uuid, object_uuid, rel.kind },
+        ) catch {
+            stderr.print("Error: could not insert relationship\n", .{}) catch {};
+            return error.SqlFailed;
+        };
+        rel_count += 1;
+    }
+
+    // INSERT notes
+    var note_count: u32 = 0;
+    for (notes) |note| {
+        const pub_uuid = resolveRef(pubs, uuids, note.publication) orelse note.publication;
+
+        var note_rand: [16]u8 = undefined;
+        rand.bytes(&note_rand);
+        var note_uuid: [36]u8 = undefined;
+        uuidV4(&note_uuid, &note_rand);
+
+        database.execParams(
+            "INSERT INTO notes (id, publication, body) VALUES (?1, ?2, ?3);",
+            &.{ &note_uuid, pub_uuid, note.body },
+        ) catch {
+            stderr.print("Error: could not insert note\n", .{}) catch {};
+            return error.SqlFailed;
+        };
+        note_count += 1;
+    }
+
+    // COMMIT
+    database.exec("COMMIT;") catch {
+        stderr.print("Error: could not commit transaction\n", .{}) catch {};
+        return error.SqlFailed;
+    };
+
+    // Write output JSON
+    stdout.print("{{\"publications\":{d},\"relationships\":{d},\"notes\":{d},\"refs\":{{", .{
+        pubs.len,
+        rel_count,
+        note_count,
+    }) catch return error.SqlFailed;
+
+    var first = true;
+    for (pubs, 0..) |p, i| {
+        if (p.ref) |ref| {
+            if (!first) stdout.writeAll(",") catch return error.SqlFailed;
+            encodeJsonString(ref, .{}, stdout) catch return error.SqlFailed;
+            stdout.writeAll(":") catch return error.SqlFailed;
+            encodeJsonString(&uuids[i], .{}, stdout) catch return error.SqlFailed;
+            first = false;
+        }
+    }
+
+    stdout.writeAll("}}\n") catch return error.SqlFailed;
+}
+
+/// Resolve a reference string: check if it matches any publication ref,
+/// and if so return the corresponding UUID. Returns null if not found in refs.
+fn resolveRef(pubs: []const LoadPublication, uuids: []const [36]u8, ref: []const u8) ?[]const u8 {
+    for (pubs, 0..) |p, i| {
+        if (p.ref) |r| {
+            if (std.mem.eql(u8, ref, r)) return &uuids[i];
+        }
+    }
+    return null;
+}
+
 // ── Skill ──
 
 pub const skillUsage =
@@ -1106,6 +1415,42 @@ pub const skillContent =
     \\ken -D combined.db merge -f agent1.db
     \\ken -D combined.db merge -f agent2.db --force
     \\```
+    \\
+    \\## Batch loading
+    \\
+    \\```sh
+    \\ken [-D <path>] load <file.json>
+    \\```
+    \\
+    \\Insert publications, relationships, and notes from a JSON file in a single
+    \\transaction. This is much faster than invoking `ken add` / `ken relate` in a
+    \\loop.
+    \\
+    \\JSON format:
+    \\```json
+    \\{
+    \\  "publications": [
+    \\    {"ref": "p1", "kind": "arxiv", "key": "2301.07041", "title": "Paper A"},
+    \\    {"ref": "t1", "kind": "topic", "title": "Scaling Laws"}
+    \\  ],
+    \\  "relationships": [
+    \\    {"subject": "p1", "object": "t1", "kind": "derives-from"}
+    \\  ],
+    \\  "notes": [
+    \\    {"publication": "p1", "body": "Important paper about scaling."}
+    \\  ]
+    \\}
+    \\```
+    \\
+    \\- All three arrays are optional. `{}` is a valid no-op.
+    \\- `ref` on publications is optional — only needed when referenced elsewhere.
+    \\- In relationships/notes, subject/object/publication resolves as a ref first,
+    \\  then as a UUID of an existing DB row.
+    \\- All referenced kinds must already exist in the DB.
+    \\- UUIDs are generated by ken (never in the JSON).
+    \\
+    \\Output: `{"publications":N,"relationships":N,"notes":N,"refs":{"p1":"uuid",...}}`
+    \\The refs map gives the generated UUID for every labelled publication.
     \\
     \\## Workflow example
     \\
@@ -1885,6 +2230,279 @@ test "executeMergeAction: invalid source (not a ken db)" {
     const result = executeMergeAction(&target, testing.allocator, .{ .source_path = "_test_merge_inv_source.db" }, &out, &err_w);
     try testing.expectError(error.InvalidSource, result);
     try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "source is not a ken database") != null);
+}
+
+// ── parseLoadArgs tests ──
+
+test "load: file path" {
+    const args = mkArgs(&.{ "ken", "load", "data.json" });
+    const action = try parseLoadArgs(&args, 1);
+    try testing.expectEqualStrings("data.json", action.file_path);
+}
+
+test "load: missing file path" {
+    const args = mkArgs(&.{ "ken", "load" });
+    const result = parseLoadArgs(&args, 1);
+    try testing.expectError(error.MissingArgument, result);
+}
+
+test "load: help flag" {
+    const args = mkArgs(&.{ "ken", "load", "-h" });
+    const result = parseLoadArgs(&args, 1);
+    try testing.expectError(error.HelpRequested, result);
+}
+
+test "load: extra arg is error" {
+    const args = mkArgs(&.{ "ken", "load", "a.json", "b.json" });
+    const result = parseLoadArgs(&args, 1);
+    try testing.expectError(error.UnknownFlag, result);
+}
+
+// ── executeLoadAction tests ──
+
+fn testRandom() std.Random {
+    var prng = std.Random.Pcg.init(42);
+    return prng.random();
+}
+
+test "executeLoadAction: empty object is no-op" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    var prng = std.Random.Pcg.init(42);
+    try executeLoadAction(&database, testing.allocator, "{}", prng.random(), &out, &err_w);
+    const output = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output, "\"publications\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"relationships\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"notes\":0") != null);
+}
+
+test "executeLoadAction: insert publications with refs" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const json =
+        \\{"publications":[
+        \\  {"ref":"p1","kind":"arxiv","key":"2301.07041","title":"Paper A"},
+        \\  {"ref":"t1","kind":"topic","title":"Scaling Laws"}
+        \\]}
+    ;
+
+    var prng = std.Random.Pcg.init(42);
+    try executeLoadAction(&database, testing.allocator, json, prng.random(), &out, &err_w);
+    const output = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output, "\"publications\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"p1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"t1\"") != null);
+}
+
+test "executeLoadAction: publications with relationships" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const json =
+        \\{"publications":[
+        \\  {"ref":"p1","kind":"arxiv","key":"2301.07041","title":"Paper A"},
+        \\  {"ref":"t1","kind":"topic","title":"Scaling Laws"}
+        \\],
+        \\"relationships":[
+        \\  {"subject":"p1","object":"t1","kind":"derives-from"}
+        \\]}
+    ;
+
+    var prng = std.Random.Pcg.init(99);
+    try executeLoadAction(&database, testing.allocator, json, prng.random(), &out, &err_w);
+    const output = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output, "\"publications\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"relationships\":1") != null);
+}
+
+test "executeLoadAction: publications with notes" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const json =
+        \\{"publications":[
+        \\  {"ref":"p1","kind":"arxiv","key":"2301.07041","title":"Paper A"}
+        \\],
+        \\"notes":[
+        \\  {"publication":"p1","body":"Important paper about scaling."}
+        \\]}
+    ;
+
+    var prng = std.Random.Pcg.init(7);
+    try executeLoadAction(&database, testing.allocator, json, prng.random(), &out, &err_w);
+    const output = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output, "\"publications\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"notes\":1") != null);
+}
+
+test "executeLoadAction: duplicate ref error" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const json =
+        \\{"publications":[
+        \\  {"ref":"p1","kind":"arxiv","title":"A"},
+        \\  {"ref":"p1","kind":"arxiv","title":"B"}
+        \\]}
+    ;
+
+    var prng = std.Random.Pcg.init(42);
+    const result = executeLoadAction(&database, testing.allocator, json, prng.random(), &out, &err_w);
+    try testing.expectError(error.DuplicateRef, result);
+    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "duplicate ref") != null);
+}
+
+test "executeLoadAction: unresolved ref error" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const json =
+        \\{"publications":[
+        \\  {"ref":"p1","kind":"arxiv","title":"A"}
+        \\],
+        \\"relationships":[
+        \\  {"subject":"p1","object":"nonexistent","kind":"cites"}
+        \\]}
+    ;
+
+    var prng = std.Random.Pcg.init(42);
+    const result = executeLoadAction(&database, testing.allocator, json, prng.random(), &out, &err_w);
+    try testing.expectError(error.UnresolvedRef, result);
+    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "unresolved reference") != null);
+}
+
+test "executeLoadAction: unknown publication kind error" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const json =
+        \\{"publications":[
+        \\  {"kind":"bogus","title":"A"}
+        \\]}
+    ;
+
+    var prng = std.Random.Pcg.init(42);
+    const result = executeLoadAction(&database, testing.allocator, json, prng.random(), &out, &err_w);
+    try testing.expectError(error.MissingKind, result);
+    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "unknown publication kind") != null);
+}
+
+test "executeLoadAction: unknown relationship kind error" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const json =
+        \\{"publications":[
+        \\  {"ref":"p1","kind":"arxiv","title":"A"},
+        \\  {"ref":"p2","kind":"arxiv","title":"B"}
+        \\],
+        \\"relationships":[
+        \\  {"subject":"p1","object":"p2","kind":"bogus-rel"}
+        \\]}
+    ;
+
+    var prng = std.Random.Pcg.init(42);
+    const result = executeLoadAction(&database, testing.allocator, json, prng.random(), &out, &err_w);
+    try testing.expectError(error.MissingKind, result);
+    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "unknown relationship kind") != null);
+}
+
+test "executeLoadAction: invalid JSON error" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    var prng = std.Random.Pcg.init(42);
+    const result = executeLoadAction(&database, testing.allocator, "not json", prng.random(), &out, &err_w);
+    try testing.expectError(error.InvalidJson, result);
+}
+
+test "executeLoadAction: UUID reference in relationship" {
+    var database = try testDb();
+    defer database.close();
+
+    // First insert a publication manually to get a known UUID
+    try database.execParams(
+        "INSERT INTO publications (id, kind, title) VALUES (?1, ?2, ?3);",
+        &.{ "550e8400-e29b-41d4-a716-446655440000", "arxiv", "Existing paper" },
+    );
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const json =
+        \\{"publications":[
+        \\  {"ref":"p1","kind":"arxiv","title":"New paper"}
+        \\],
+        \\"relationships":[
+        \\  {"subject":"p1","object":"550e8400-e29b-41d4-a716-446655440000","kind":"cites"}
+        \\]}
+    ;
+
+    var prng = std.Random.Pcg.init(42);
+    try executeLoadAction(&database, testing.allocator, json, prng.random(), &out, &err_w);
+    const output = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output, "\"publications\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"relationships\":1") != null);
+}
+
+test "looksLikeUuid: valid UUID" {
+    try testing.expect(looksLikeUuid("550e8400-e29b-41d4-a716-446655440000"));
+}
+
+test "looksLikeUuid: invalid strings" {
+    try testing.expect(!looksLikeUuid("not-a-uuid"));
+    try testing.expect(!looksLikeUuid("550e8400-e29b-41d4-a716-44665544000")); // too short
+    try testing.expect(!looksLikeUuid("550e8400-e29b-41d4-a716-4466554400000")); // too long
+    try testing.expect(!looksLikeUuid("550e8400xe29b-41d4-a716-446655440000")); // wrong separator
 }
 
 test "executeMergeAction: merges new publication kind from source" {
