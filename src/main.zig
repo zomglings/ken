@@ -424,8 +424,7 @@ pub fn main(process: std.process.Init) !void {
             // Read file
             const max_load_size = 50 * 1024 * 1024; // 50 MB
             const file_content = blk: {
-                const path_z: [:0]const u8 = @ptrCast(action.file_path);
-                const file = Io.Dir.openFile(.cwd(), process.io, path_z, .{}) catch {
+                const file = Io.Dir.openFile(.cwd(), process.io, action.file_path, .{}) catch {
                     try stderr.print("Error: could not open file '{s}'\n", .{action.file_path});
                     try stderr.flush();
                     return;

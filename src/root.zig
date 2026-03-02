@@ -977,7 +977,7 @@ const LoadData = struct {
 };
 
 pub const LoadAction = struct {
-    file_path: []const u8,
+    file_path: [:0]const u8,
 };
 
 pub const loadUsage =
@@ -1017,12 +1017,11 @@ pub const loadUsage =
 pub fn parseLoadArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!LoadAction {
     const rest = args[cmd_index + 1 ..];
 
-    var file_path: ?[]const u8 = null;
+    var file_path: ?[:0]const u8 = null;
     for (rest) |arg| {
-        const a: []const u8 = arg;
-        if (isHelpFlag(a)) return error.HelpRequested;
+        if (isHelpFlag(arg)) return error.HelpRequested;
         if (file_path != null) return error.UnknownFlag;
-        file_path = a;
+        file_path = arg;
     }
     if (file_path == null) return error.MissingArgument;
     return .{ .file_path = file_path.? };
@@ -1071,8 +1070,6 @@ pub fn executeLoadAction(
     const rels = load.relationships orelse &.{};
     const notes = load.notes orelse &.{};
 
-    // Build ref_map: ref string → index in pubs array
-    // Use a simple linear scan since publication counts are modest.
     // Check for duplicate refs.
     var has_dup = false;
     for (pubs, 0..) |p, i| {
@@ -1242,24 +1239,23 @@ pub fn executeLoadAction(
     stdout.writeAll("}}\n") catch return error.SqlFailed;
 }
 
-/// Check if a ref label exists in the publications array.
-fn refExists(pubs: []const LoadPublication, ref: []const u8) bool {
-    return for (pubs) |p| {
-        if (p.ref) |r| {
-            if (std.mem.eql(u8, ref, r)) break true;
-        }
-    } else false;
-}
-
-/// Resolve a reference string: check if it matches any publication ref,
-/// and if so return the corresponding UUID. Returns null if not found in refs.
-fn resolveRef(pubs: []const LoadPublication, uuids: []const [36]u8, ref: []const u8) ?[]const u8 {
+/// Find the index of a ref label in the publications array.
+fn findRefIndex(pubs: []const LoadPublication, ref: []const u8) ?usize {
     for (pubs, 0..) |p, i| {
         if (p.ref) |r| {
-            if (std.mem.eql(u8, ref, r)) return &uuids[i];
+            if (std.mem.eql(u8, ref, r)) return i;
         }
     }
     return null;
+}
+
+fn refExists(pubs: []const LoadPublication, ref: []const u8) bool {
+    return findRefIndex(pubs, ref) != null;
+}
+
+fn resolveRef(pubs: []const LoadPublication, uuids: []const [36]u8, ref: []const u8) ?[]const u8 {
+    const i = findRefIndex(pubs, ref) orelse return null;
+    return &uuids[i];
 }
 
 // ── Skill ──
