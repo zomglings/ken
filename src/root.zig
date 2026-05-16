@@ -5,7 +5,7 @@ const builtin = @import("builtin");
 pub const db = @import("db.zig");
 const encodeJsonString = std.json.Stringify.encodeJsonString;
 
-pub const version: u32 = 1;
+pub const version: u32 = 2;
 pub const default_db_name = "ken.db";
 
 /// Human-readable default database path for help text, resolved at comptime.
@@ -1708,8 +1708,12 @@ test "executeKindAction: show not found" {
     var err_w: std.Io.Writer = .fixed(&err_buf);
 
     const result = executeKindAction(&database, testing.allocator, .pubkind, .{ .show = .{ .name = "nonexistent" } }, &out, &err_w);
+    // Must return an error (so the CLI can exit non-zero) and write the
+    // diagnostic to stderr, leaving stdout empty. This contract backs the
+    // `ken pubkind show X || ken pubkind add X` idempotent-guard idiom.
     try testing.expectError(error.NotFound, result);
     try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "not found") != null);
+    try testing.expectEqualStrings("", out.buffered());
 }
 
 test "executeKindAction: list with seeded kinds" {

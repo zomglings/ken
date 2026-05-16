@@ -532,8 +532,12 @@ pub fn main(process: std.process.Init) !void {
             defer database.close();
 
             ken.executeKindAction(&database, arena, entity, action, stdout, stderr) catch {
-                try stderr.flush();
-                return;
+                // executeKindAction has already written a descriptive
+                // "Error: ..." message to stderr. Exit non-zero so that
+                // shell idioms like `ken pubkind show X || ken pubkind add X`
+                // work as expected (a missing kind must be a failure).
+                stderr.flush() catch {};
+                std.process.exit(1);
             };
             try stdout.flush();
         },
