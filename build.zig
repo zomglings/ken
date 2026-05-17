@@ -133,44 +133,14 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the unit test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    // `zig build test` runs ONLY the in-process unit tests (src/root.zig via
+    // `zig build test` runs the in-process unit tests (src/root.zig via
     // `mod`). These call Zig functions directly and need neither the built
-    // binary nor the `build_options` exe-path injection.
+    // binary nor any exe-path injection. CLI exit-code / end-to-end behavior
+    // is exercised separately in CI (.github/workflows/test.yml) as pure
+    // shell assertions against the built binary, so there is no Zig
+    // integration-test target here.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
-
-    // ---------------------------------------------------------------------
-    // Integration tests (`zig build test-integration`).
-    //
-    // src/integration_test.zig spawns the freshly built `ken` binary as a
-    // subprocess and asserts its exit code. These are integration tests, not
-    // unit tests, so they are deliberately kept out of the default `zig build
-    // test` path. This uses a dedicated module so we can inject the path of
-    // the freshly built `ken` binary without creating a dependency cycle (the
-    // exe must not depend on its own emitted-binary path).
-    // ---------------------------------------------------------------------
-    const integration_test_options = b.addOptions();
-    integration_test_options.addOptionPath("ken_exe_path", exe.getEmittedBin());
-
-    const integration_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/integration_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "build_options", .module = integration_test_options.createModule() },
-            },
-        }),
-    });
-
-    // A run step that will run the integration test executable.
-    const run_integration_tests = b.addRunArtifact(integration_tests);
-
-    const integration_test_step = b.step(
-        "test-integration",
-        "Build the ken binary and run the integration tests",
-    );
-    integration_test_step.dependOn(&run_integration_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
