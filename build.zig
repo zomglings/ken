@@ -130,39 +130,47 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
 
-    // A run step that will run the test executable.
+    // A run step that will run the unit test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    // Creates an executable that will run `test` blocks from src/main.zig.
-    // Note that test executables only test one module at a time, hence why we
-    // have to create two separate ones. This uses a dedicated module (rather
-    // than reusing exe.root_module) so we can inject the path of the freshly
-    // built `ken` binary without creating a dependency cycle (the exe must not
-    // depend on its own emitted-binary path).
-    const exe_test_options = b.addOptions();
-    exe_test_options.addOptionPath("ken_exe_path", exe.getEmittedBin());
+    // `zig build test` runs ONLY the in-process unit tests (src/root.zig via
+    // `mod`). These call Zig functions directly and need neither the built
+    // binary nor the `build_options` exe-path injection.
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_mod_tests.step);
 
-    const exe_tests = b.addTest(.{
+    // ---------------------------------------------------------------------
+    // Integration tests (`zig build test-integration`).
+    //
+    // src/integration_test.zig spawns the freshly built `ken` binary as a
+    // subprocess and asserts its exit code. These are integration tests, not
+    // unit tests, so they are deliberately kept out of the default `zig build
+    // test` path. This uses a dedicated module so we can inject the path of
+    // the freshly built `ken` binary without creating a dependency cycle (the
+    // exe must not depend on its own emitted-binary path).
+    // ---------------------------------------------------------------------
+    const integration_test_options = b.addOptions();
+    integration_test_options.addOptionPath("ken_exe_path", exe.getEmittedBin());
+
+    const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/integration_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "ken", .module = mod },
-                .{ .name = "build_options", .module = exe_test_options.createModule() },
+                .{ .name = "build_options", .module = integration_test_options.createModule() },
             },
         }),
     });
 
-    // A run step that will run the second test executable.
-    const run_exe_tests = b.addRunArtifact(exe_tests);
+    // A run step that will run the integration test executable.
+    const run_integration_tests = b.addRunArtifact(integration_tests);
 
-    // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
-    const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
+    const integration_test_step = b.step(
+        "test-integration",
+        "Build the ken binary and run the integration tests",
+    );
+    integration_test_step.dependOn(&run_integration_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
