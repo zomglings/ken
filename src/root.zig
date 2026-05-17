@@ -1456,6 +1456,11 @@ pub const skillContent =
     \\
     \\- Every command and subcommand responds to `-h`/`--help` with scoped help text.
     \\  Explore the CLI by running `ken -h`, `ken add -h`, `ken pubkind list -h`, etc.
+    \\- Exit codes are uniform: every command exits 0 on success and 1 on any
+    \\  failure — bad arguments, usage errors, not-found, database errors, file
+    \\  errors, JSON parse errors, conflicts, unknown commands/flags, or missing
+    \\  required options. Diagnostics go to stderr; machine output to stdout. This
+    \\  makes `ken <cmd> ... || handle_failure` a reliable guard in any pipeline.
     \\- All output intended for machine consumption is JSON.
     \\- Every database command accepts `-D/--db <path>` to target a specific database.
     \\  If omitted, a platform-specific default is used (run `ken initpath` to see it).
@@ -1544,8 +1549,9 @@ pub const skillContent =
     \\role means the other points at this one. `body` is `""` when there is
     \\no note body.
     \\
-    \\Exits non-zero (with a diagnostic on stderr) if no publication matches,
-    \\so `ken show <id> >/dev/null 2>&1 && ...` works as a guard.
+    \\Exits 1 (with a diagnostic on stderr) if no publication matches — as do
+    \\all error paths CLI-wide — so `ken show <id> >/dev/null 2>&1 && ...`
+    \\works as a guard.
     \\
     \\Examples:
     \\```sh

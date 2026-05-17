@@ -133,11 +133,25 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    // Creates an executable that will run `test` blocks from the executable's
-    // root module. Note that test executables only test one module at a time,
-    // hence why we have to create two separate ones.
+    // Creates an executable that will run `test` blocks from src/main.zig.
+    // Note that test executables only test one module at a time, hence why we
+    // have to create two separate ones. This uses a dedicated module (rather
+    // than reusing exe.root_module) so we can inject the path of the freshly
+    // built `ken` binary without creating a dependency cycle (the exe must not
+    // depend on its own emitted-binary path).
+    const exe_test_options = b.addOptions();
+    exe_test_options.addOptionPath("ken_exe_path", exe.getEmittedBin());
+
     const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ken", .module = mod },
+                .{ .name = "build_options", .module = exe_test_options.createModule() },
+            },
+        }),
     });
 
     // A run step that will run the second test executable.
