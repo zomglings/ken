@@ -1461,6 +1461,8 @@ pub const skillContent =
     \\  errors, JSON parse errors, conflicts, unknown commands/flags, or missing
     \\  required options. Diagnostics go to stderr; machine output to stdout. This
     \\  makes `ken <cmd> ... || handle_failure` a reliable guard in any pipeline.
+    \\  (`dbversion` on a file with no ken schema is not a failure: it prints
+    \\  `not initialized` to stdout and exits 0.)
     \\- All output intended for machine consumption is JSON.
     \\- Every database command accepts `-D/--db <path>` to target a specific database.
     \\  If omitted, a platform-specific default is used (run `ken initpath` to see it).
@@ -1470,11 +1472,16 @@ pub const skillContent =
     \\- The database can be queried directly with SQL. Prefer the CLI when possible,
     \\  as it encapsulates schema assumptions (FK constraints, UUID generation,
     \\  timestamps, conflict resolution).
+    \\- There are two distinct version numbers. `ken version` prints the CLI's
+    \\  own version. `ken [-D <path>] dbversion` prints the schema version of a
+    \\  database (or `not initialized` if the file has no ken schema yet); they
+    \\  are not the same number and must not be conflated.
     \\
     \\## Setup
     \\
     \\```sh
-    \\# Create or upgrade the default database
+    \\# Create or upgrade the default database (idempotent — safe to re-run;
+    \\# upgrades the schema in place if the CLI is newer than the database)
     \\ken init
     \\
     \\# Create a database at a specific path
@@ -1482,6 +1489,10 @@ pub const skillContent =
     \\
     \\# Print the default database path
     \\ken initpath
+    \\
+    \\# Print the CLI version, and the schema version of a database
+    \\ken version
+    \\ken -D ~/research/ml.db dbversion
     \\```
     \\
     \\## Adding publications
@@ -1490,9 +1501,11 @@ pub const skillContent =
     \\ken [-D <path>] add <kind> [-k/--key <key>] [--title <title>]
     \\```
     \\
-    \\Prints the UUID of the new publication to stdout.
+    \\Prints the UUID of the new publication to stdout. Both `--key` and
+    \\`--title` are optional for every kind. Keys are not required to be
+    \\unique: adding two publications with the same key is allowed.
     \\
-    \\Built-in publication kinds and their key formats:
+    \\The five built-in publication kinds and their key formats:
     \\- `arxiv` — arXiv identifier (e.g. `2301.07041`). URL: `https://arxiv.org/abs/{key}`
     \\- `video` — YouTube video ID (11 chars). URL: `https://www.youtube.com/watch?v={key}`
     \\- `web` — full URL including scheme (e.g. `https://example.com/page`)
@@ -1539,7 +1552,9 @@ pub const skillContent =
     \\
     \\Prints a publication's full record (id, kind, key, title), its note body
     \\if it has one (notes added via `ken add note`), and its relationships
-    \\(both directions). Look it up by UUID (positional) or by key (`--key`).
+    \\(both directions). Look it up by the full UUID (positional — id prefixes
+    \\are not accepted) or by key (`--key`). Because keys are not unique,
+    \\`--key` returns the first matching publication (earliest inserted).
     \\
     \\Without `--json`, output is human-readable. With `--json`, output is a
     \\single object: `{"id","kind","key","title","body","relationships":[...]}`
@@ -1589,7 +1604,12 @@ pub const skillContent =
     \\## Managing kinds
     \\
     \\Publication kinds and relationship kinds each have `show`, `list`, `add`,
-    \\`remove`, and `update` subcommands.
+    \\`remove`, and `update` subcommands. `list` emits a name-sorted JSON array
+    \\of `{"name":...}` objects; pass `--descriptions` to include each
+    \\`description`. `show <name>` emits one `{"name","description"}` object.
+    \\`add <name> <description>` and `update <name> [--name N] [--description D]`
+    \\(at least one of `--name`/`--description` required); `remove <name>`
+    \\fails if any publication/relationship still uses the kind.
     \\
     \\```sh
     \\ken pubkind list --descriptions    # list publication kinds with descriptions
