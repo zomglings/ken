@@ -17,6 +17,7 @@ const usage =
     \\  add        Add a publication
     \\  relate     Create a relationship between publications
     \\  list       List publications
+    \\  show       Show a publication's record, note body, and relationships
     \\  load       Load publications from a JSON file
     \\  merge      Merge two ken databases
     \\  skill      Generate agent skills
@@ -34,6 +35,7 @@ const Command = enum {
     add,
     relate,
     list,
+    show,
     load,
     merge,
     skill,
@@ -51,6 +53,7 @@ fn printCommandUsage(cmd: Command, stdout: anytype) !void {
         .add => try stdout.writeAll(ken.addUsage),
         .relate => try stdout.writeAll(ken.relateUsage),
         .list => try stdout.writeAll(ken.listUsage),
+        .show => try stdout.writeAll(ken.showUsage),
         .load => try stdout.writeAll(ken.loadUsage),
         .pubkind => try stdout.writeAll(ken.kindUsage(.pubkind)),
         .relkind => try stdout.writeAll(ken.kindUsage(.relkind)),
@@ -117,7 +120,7 @@ pub fn main(process: std.process.Init) !void {
     // own parsers (add) handle -h internally so help is scoped to the
     // specific subcommand being asked about.
     switch (cmd) {
-        .pubkind, .relkind, .add, .relate, .list, .load, .merge => {},
+        .pubkind, .relkind, .add, .relate, .list, .show, .load, .merge => {},
         else => {
             if (hasHelpFlag(args[2..])) {
                 try printCommandUsage(cmd, stdout);
@@ -400,6 +403,44 @@ pub fn main(process: std.process.Init) !void {
 
             ken.executeListAction(&database, arena, action, stdout) catch {
                 try stderr.print("Error: could not list publications\n", .{});
+                try stderr.flush();
+                return;
+            };
+            try stdout.flush();
+        },
+        .show => {
+            const action = ken.parseShowArgs(args, 1) catch |err| {
+                if (err == error.HelpRequested) {
+                    try stdout.writeAll(ken.showUsage);
+                    try stdout.flush();
+                    return;
+                }
+                switch (err) {
+                    error.MissingArgument => try stderr.print("Error: missing argument. Usage: ken show <id> [--json] | ken show --key <key> [--json]\n", .{}),
+                    error.UnknownFlag => try stderr.print("Error: unknown or conflicting argument. Usage: ken show <id> [--json] | ken show --key <key> [--json]\n", .{}),
+                    else => try stderr.print("Error: invalid arguments for 'show'\n", .{}),
+                }
+                try stderr.flush();
+                return;
+            };
+
+            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
+            var database = ken.db.Db.open(db_path) catch {
+                try stderr.print("Error: could not open database '{s}'\n", .{db_path});
+                try stderr.flush();
+                return;
+            };
+            defer database.close();
+
+            ken.executeShowAction(&database, arena, action, stdout, stderr) catch |err| {
+                if (err == error.NotFound) {
+                    // executeShowAction has already written a descriptive
+                    // "Error: ..." message to stderr. Exit non-zero so shell
+                    // idioms like `ken show <id> || ...` work as expected.
+                    stderr.flush() catch {};
+                    std.process.exit(1);
+                }
+                try stderr.print("Error: could not show publication\n", .{});
                 try stderr.flush();
                 return;
             };

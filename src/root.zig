@@ -5,7 +5,7 @@ const builtin = @import("builtin");
 pub const db = @import("db.zig");
 const encodeJsonString = std.json.Stringify.encodeJsonString;
 
-pub const version: u32 = 2;
+pub const version: u32 = 3;
 pub const default_db_name = "ken.db";
 
 /// Human-readable default database path for help text, resolved at comptime.
@@ -621,6 +621,188 @@ fn writePublicationRows(rows: [][4][]const u8, stdout: anytype) !void {
         try stdout.writeAll("}");
     }
     try stdout.writeAll("]\n");
+}
+
+// ── Show ──
+
+pub const showUsage =
+    \\Usage: ken [-D <path>] show <id> [--json]
+    \\       ken [-D <path>] show --key <key> [--json]
+    \\
+    \\Print a publication's full record, its note body (if any), and its
+    \\relationships. Look it up by UUID (positional) or by key (--key).
+    \\
+    \\Options:
+    \\
+++ db_flag_help ++
+    \\  --key <key>      Look up the publication by its key instead of id
+    \\  --json           Emit a single machine-readable JSON object
+    \\
+    \\Without --json, output is a human-readable record. With --json, output
+    \\is one JSON object with id, kind, key, title, body, and relationships.
+    \\
+    \\Examples:
+    \\  ken show 1f2e3d4c-5b6a-7980-1234-567890abcdef
+    \\  ken show --key 2301.07041
+    \\  ken show --key 2301.07041 --json
+    \\
+;
+
+pub const ShowAction = struct {
+    /// Exactly one of `id` or `key` is set after parsing.
+    id: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    json: bool = false,
+};
+
+/// Parse arguments for `ken show <id> [--json]` or
+/// `ken show --key <key> [--json]`.
+/// `args` is full argv; `cmd_index` is the index of "show".
+pub fn parseShowArgs(args: []const [:0]const u8, cmd_index: usize) ParseError!ShowAction {
+    const rest = args[cmd_index + 1 ..];
+    if (rest.len == 0) return error.MissingArgument;
+
+    var result = ShowAction{};
+
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const arg: []const u8 = rest[i];
+        if (isHelpFlag(arg)) return error.HelpRequested;
+        if (std.mem.eql(u8, arg, "--key")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingArgument;
+            if (result.key != null or result.id != null) return error.UnknownFlag;
+            result.key = rest[i];
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            result.json = true;
+        } else if (arg.len > 0 and arg[0] == '-') {
+            return error.UnknownFlag;
+        } else {
+            // Positional argument: the publication id.
+            if (result.id != null or result.key != null) return error.UnknownFlag;
+            result.id = arg;
+        }
+    }
+
+    if (result.id == null and result.key == null) return error.MissingArgument;
+    return result;
+}
+
+pub const ShowError = error{
+    NotFound,
+    SqlFailed,
+};
+
+/// Execute the show action: look up a publication by id or key, fetch its
+/// note body (if any) and its relationships, and write the result. Writes a
+/// diagnostic to stderr and returns error.NotFound when no publication
+/// matches, so the CLI can exit non-zero (mirrors executeKindAction's
+/// show contract).
+pub fn executeShowAction(
+    database: *db.Db,
+    allocator: std.mem.Allocator,
+    action: ShowAction,
+    stdout: anytype,
+    stderr: anytype,
+) ShowError!void {
+    const lookup_sql: [*:0]const u8 = if (action.id != null)
+        "SELECT id, kind, title, key FROM publications WHERE id = ?1;"
+    else
+        "SELECT id, kind, title, key FROM publications WHERE key = ?1;";
+    const lookup_val: []const u8 = action.id orelse action.key.?;
+
+    const pub_rows = database.queryRows(4, allocator, lookup_sql, &.{lookup_val}) catch return error.SqlFailed;
+    defer db.Db.freeRows(4, allocator, pub_rows);
+
+    if (pub_rows.len == 0) {
+        if (action.id) |id| {
+            stderr.print("Error: publication with id '{s}' not found\n", .{id}) catch {};
+        } else {
+            stderr.print("Error: publication with key '{s}' not found\n", .{action.key.?}) catch {};
+        }
+        return error.NotFound;
+    }
+
+    const row = pub_rows[0];
+    const pub_id = row[0];
+    const kind = row[1];
+    const title = row[2];
+    const key = row[3];
+
+    // Note body (notes.body). A publication has at most one note row in
+    // practice (created by `add` for the `note` kind), but be defensive and
+    // take the most recent one.
+    const body = database.queryTextParams(
+        allocator,
+        "SELECT body FROM notes WHERE publication = ?1 ORDER BY created_at DESC LIMIT 1;",
+        &.{pub_id},
+    ) catch return error.SqlFailed;
+    defer if (body) |b| allocator.free(b);
+
+    // Relationships where this publication is the subject or the object.
+    // Columns: role ('subject'|'object'), relkind, other publication id.
+    const rel_rows = database.queryRows(
+        3,
+        allocator,
+        \\SELECT 'subject', kind, object FROM relationships WHERE subject = ?1
+        \\UNION ALL
+        \\SELECT 'object', kind, subject FROM relationships WHERE object = ?1
+        \\ORDER BY 1, 2;
+    ,
+        &.{pub_id},
+    ) catch return error.SqlFailed;
+    defer db.Db.freeRows(3, allocator, rel_rows);
+
+    if (action.json) {
+        stdout.writeAll("{\"id\":") catch return error.SqlFailed;
+        encodeJsonString(pub_id, .{}, stdout) catch return error.SqlFailed;
+        stdout.writeAll(",\"kind\":") catch return error.SqlFailed;
+        encodeJsonString(kind, .{}, stdout) catch return error.SqlFailed;
+        stdout.writeAll(",\"key\":") catch return error.SqlFailed;
+        encodeJsonString(key, .{}, stdout) catch return error.SqlFailed;
+        stdout.writeAll(",\"title\":") catch return error.SqlFailed;
+        encodeJsonString(title, .{}, stdout) catch return error.SqlFailed;
+        stdout.writeAll(",\"body\":") catch return error.SqlFailed;
+        encodeJsonString(body orelse "", .{}, stdout) catch return error.SqlFailed;
+        stdout.writeAll(",\"relationships\":[") catch return error.SqlFailed;
+        for (rel_rows, 0..) |rel, idx| {
+            if (idx > 0) stdout.writeAll(",") catch return error.SqlFailed;
+            stdout.writeAll("{\"role\":") catch return error.SqlFailed;
+            encodeJsonString(rel[0], .{}, stdout) catch return error.SqlFailed;
+            stdout.writeAll(",\"relkind\":") catch return error.SqlFailed;
+            encodeJsonString(rel[1], .{}, stdout) catch return error.SqlFailed;
+            stdout.writeAll(",\"publication\":") catch return error.SqlFailed;
+            encodeJsonString(rel[2], .{}, stdout) catch return error.SqlFailed;
+            stdout.writeAll("}") catch return error.SqlFailed;
+        }
+        stdout.writeAll("]}\n") catch return error.SqlFailed;
+    } else {
+        stdout.print("id:    {s}\n", .{pub_id}) catch return error.SqlFailed;
+        stdout.print("kind:  {s}\n", .{kind}) catch return error.SqlFailed;
+        stdout.print("key:   {s}\n", .{key}) catch return error.SqlFailed;
+        stdout.print("title: {s}\n", .{title}) catch return error.SqlFailed;
+        if (rel_rows.len > 0) {
+            stdout.writeAll("relationships:\n") catch return error.SqlFailed;
+            for (rel_rows) |rel| {
+                // role 'subject' → this -[relkind]-> other
+                // role 'object'  → other -[relkind]-> this
+                if (std.mem.eql(u8, rel[0], "subject")) {
+                    stdout.print("  -[{s}]-> {s}\n", .{ rel[1], rel[2] }) catch return error.SqlFailed;
+                } else {
+                    stdout.print("  <-[{s}]- {s}\n", .{ rel[1], rel[2] }) catch return error.SqlFailed;
+                }
+            }
+        }
+        stdout.writeAll("\n") catch return error.SqlFailed;
+        if (body) |b| {
+            stdout.writeAll(b) catch return error.SqlFailed;
+            if (b.len == 0 or b[b.len - 1] != '\n') {
+                stdout.writeAll("\n") catch return error.SqlFailed;
+            }
+        } else {
+            stdout.writeAll("(no note body)\n") catch return error.SqlFailed;
+        }
+    }
 }
 
 pub const relateUsage =
@@ -1339,6 +1521,41 @@ pub const skillContent =
     \\ken list --kind arxiv --limit 10
     \\ken list --offset 20 --limit 10
     \\```
+    \\
+    \\`list` returns metadata only — it never includes a note's body. Use
+    \\`ken show` to read the full record including the body.
+    \\
+    \\## Reading a publication
+    \\
+    \\```sh
+    \\ken [-D <path>] show <id> [--json]
+    \\ken [-D <path>] show --key <key> [--json]
+    \\```
+    \\
+    \\Prints a publication's full record (id, kind, key, title), its note body
+    \\if it has one (notes added via `ken add note`), and its relationships
+    \\(both directions). Look it up by UUID (positional) or by key (`--key`).
+    \\
+    \\Without `--json`, output is human-readable. With `--json`, output is a
+    \\single object: `{"id","kind","key","title","body","relationships":[...]}`
+    \\where each relationship is
+    \\`{"role":"subject"|"object","relkind":...,"publication":<other-id>}`.
+    \\A `subject` role means this publication points at the other; an `object`
+    \\role means the other points at this one. `body` is `""` when there is
+    \\no note body.
+    \\
+    \\Exits non-zero (with a diagnostic on stderr) if no publication matches,
+    \\so `ken show <id> >/dev/null 2>&1 && ...` works as a guard.
+    \\
+    \\Examples:
+    \\```sh
+    \\ken show 1f2e3d4c-5b6a-7980-1234-567890abcdef
+    \\ken show --key 2301.07041
+    \\ken show --key 2301.07041 --json
+    \\```
+    \\
+    \\This is how a multi-step agent reads back its own earlier notes through
+    \\the CLI instead of reaching around ken to the on-disk database.
     \\
     \\## Relationships
     \\
@@ -2518,4 +2735,211 @@ test "executeMergeAction: merges new publication kind from source" {
     // Verify the kind exists in target
     const exists = try target.exists("SELECT 1 FROM publication_kinds WHERE name = ?1;", &.{"book"});
     try testing.expect(exists);
+}
+
+// ── parseShowArgs tests ──
+
+test "parseShowArgs: positional id" {
+    const args = mkArgs(&.{ "ken", "show", "abc-123" });
+    const action = try parseShowArgs(&args, 1);
+    try testing.expectEqualStrings("abc-123", action.id.?);
+    try testing.expect(action.key == null);
+    try testing.expect(!action.json);
+}
+
+test "parseShowArgs: --key lookup" {
+    const args = mkArgs(&.{ "ken", "show", "--key", "2301.07041" });
+    const action = try parseShowArgs(&args, 1);
+    try testing.expectEqualStrings("2301.07041", action.key.?);
+    try testing.expect(action.id == null);
+}
+
+test "parseShowArgs: --json with id" {
+    const args = mkArgs(&.{ "ken", "show", "abc-123", "--json" });
+    const action = try parseShowArgs(&args, 1);
+    try testing.expectEqualStrings("abc-123", action.id.?);
+    try testing.expect(action.json);
+}
+
+test "parseShowArgs: --json with --key" {
+    const args = mkArgs(&.{ "ken", "show", "--key", "k1", "--json" });
+    const action = try parseShowArgs(&args, 1);
+    try testing.expectEqualStrings("k1", action.key.?);
+    try testing.expect(action.json);
+}
+
+test "parseShowArgs: missing argument" {
+    const args = mkArgs(&.{ "ken", "show" });
+    try testing.expectError(error.MissingArgument, parseShowArgs(&args, 1));
+}
+
+test "parseShowArgs: id and --key conflict" {
+    const args = mkArgs(&.{ "ken", "show", "abc-123", "--key", "k1" });
+    try testing.expectError(error.UnknownFlag, parseShowArgs(&args, 1));
+}
+
+test "parseShowArgs: two positionals rejected" {
+    const args = mkArgs(&.{ "ken", "show", "id1", "id2" });
+    try testing.expectError(error.UnknownFlag, parseShowArgs(&args, 1));
+}
+
+test "parseShowArgs: unknown flag" {
+    const args = mkArgs(&.{ "ken", "show", "--bogus" });
+    try testing.expectError(error.UnknownFlag, parseShowArgs(&args, 1));
+}
+
+test "parseShowArgs: help flag" {
+    const args = mkArgs(&.{ "ken", "show", "-h" });
+    try testing.expectError(error.HelpRequested, parseShowArgs(&args, 1));
+}
+
+test "parseShowArgs: --key without value" {
+    const args = mkArgs(&.{ "ken", "show", "--key" });
+    try testing.expectError(error.MissingArgument, parseShowArgs(&args, 1));
+}
+
+// ── executeShowAction tests ──
+
+test "executeShowAction: by id with note body and relationships" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try database.execParams(
+        "INSERT INTO publications (id, key, kind, title) VALUES (?1, ?2, ?3, ?4);",
+        &.{ "note-id", "/n.md", "note", "My Note" },
+    );
+    try database.execParams(
+        "INSERT INTO publications (id, key, kind, title) VALUES (?1, ?2, ?3, ?4);",
+        &.{ "arxiv-id", "2301.07041", "arxiv", "Paper" },
+    );
+    try database.execParams(
+        "INSERT INTO notes (id, publication, body) VALUES (?1, ?2, ?3);",
+        &.{ "note-row", "note-id", "The body text." },
+    );
+    try database.execParams(
+        "INSERT INTO relationships (id, subject, object, kind) VALUES (?1, ?2, ?3, ?4);",
+        &.{ "rel-id", "note-id", "arxiv-id", "cites" },
+    );
+
+    try executeShowAction(&database, testing.allocator, .{ .id = "note-id" }, &out, &err_w);
+    const output = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output, "id:    note-id") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "kind:  note") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "title: My Note") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "The body text.") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "-[cites]-> arxiv-id") != null);
+}
+
+test "executeShowAction: by key, json output" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try database.execParams(
+        "INSERT INTO publications (id, key, kind, title) VALUES (?1, ?2, ?3, ?4);",
+        &.{ "p1", "2301.07041", "arxiv", "Scaling" },
+    );
+    try database.execParams(
+        "INSERT INTO notes (id, publication, body) VALUES (?1, ?2, ?3);",
+        &.{ "n1", "p1", "line one\nline two" },
+    );
+
+    try executeShowAction(&database, testing.allocator, .{ .key = "2301.07041", .json = true }, &out, &err_w);
+    const output = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output, "\"id\":\"p1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"kind\":\"arxiv\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"key\":\"2301.07041\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"title\":\"Scaling\"") != null);
+    // Body must be JSON-escaped (newline → \n).
+    try testing.expect(std.mem.indexOf(u8, output, "\"body\":\"line one\\nline two\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"relationships\":[]") != null);
+}
+
+test "executeShowAction: object-role relationship" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try database.execParams(
+        "INSERT INTO publications (id, key, kind, title) VALUES (?1, ?2, ?3, ?4);",
+        &.{ "subj", "ka", "arxiv", "A" },
+    );
+    try database.execParams(
+        "INSERT INTO publications (id, key, kind, title) VALUES (?1, ?2, ?3, ?4);",
+        &.{ "obj", "kb", "arxiv", "B" },
+    );
+    try database.execParams(
+        "INSERT INTO relationships (id, subject, object, kind) VALUES (?1, ?2, ?3, ?4);",
+        &.{ "r1", "subj", "obj", "cites" },
+    );
+
+    try executeShowAction(&database, testing.allocator, .{ .id = "obj", .json = true }, &out, &err_w);
+    const output = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, output, "\"role\":\"object\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"relkind\":\"cites\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"publication\":\"subj\"") != null);
+}
+
+test "executeShowAction: not found by id returns error.NotFound" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const result = executeShowAction(&database, testing.allocator, .{ .id = "missing" }, &out, &err_w);
+    try testing.expectError(error.NotFound, result);
+    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "not found") != null);
+    try testing.expectEqualStrings("", out.buffered());
+}
+
+test "executeShowAction: not found by key returns error.NotFound" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    const result = executeShowAction(&database, testing.allocator, .{ .key = "nope" }, &out, &err_w);
+    try testing.expectError(error.NotFound, result);
+    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "key 'nope'") != null);
+}
+
+test "executeShowAction: publication with no note body" {
+    var database = try testDb();
+    defer database.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.Writer = .fixed(&err_buf);
+
+    try database.execParams(
+        "INSERT INTO publications (id, key, kind, title) VALUES (?1, ?2, ?3, ?4);",
+        &.{ "p-nobody", "kx", "arxiv", "No Body" },
+    );
+
+    try executeShowAction(&database, testing.allocator, .{ .id = "p-nobody" }, &out, &err_w);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "(no note body)") != null);
+
+    out.end = 0;
+    try executeShowAction(&database, testing.allocator, .{ .id = "p-nobody", .json = true }, &out, &err_w);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"body\":\"\"") != null);
 }
