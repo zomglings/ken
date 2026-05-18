@@ -17,6 +17,7 @@ const usage =
     \\  add        Add a publication
     \\  relate     Create a relationship between publications
     \\  list       List publications
+    \\  show       Show a publication's record, note body, and relationships
     \\  load       Load publications from a JSON file
     \\  merge      Merge two ken databases
     \\  skill      Generate agent skills
@@ -34,6 +35,7 @@ const Command = enum {
     add,
     relate,
     list,
+    show,
     load,
     merge,
     skill,
@@ -51,6 +53,7 @@ fn printCommandUsage(cmd: Command, stdout: anytype) !void {
         .add => try stdout.writeAll(ken.addUsage),
         .relate => try stdout.writeAll(ken.relateUsage),
         .list => try stdout.writeAll(ken.listUsage),
+        .show => try stdout.writeAll(ken.showUsage),
         .load => try stdout.writeAll(ken.loadUsage),
         .pubkind => try stdout.writeAll(ken.kindUsage(.pubkind)),
         .relkind => try stdout.writeAll(ken.kindUsage(.relkind)),
@@ -60,7 +63,28 @@ fn printCommandUsage(cmd: Command, stdout: anytype) !void {
     }
 }
 
+/// Sentinel error meaning "a diagnostic has already been written to stderr".
+/// Any command handler that detects a failure writes its human-readable
+/// message to stderr and then returns this (or any other) error. `main`
+/// catches *every* error returned by `run` and terminates the process with
+/// exit code 1, so every failure mode of the CLI is non-zero while success
+/// paths return normally (exit 0). Centralizing the exit here means no
+/// individual call site has to remember to call `std.process.exit(1)`.
+const CliError = error{Reported};
+
 pub fn main(process: std.process.Init) !void {
+    run(process) catch {
+        // `run` has already written a descriptive "Error: ..." message to
+        // stderr (and flushed it where possible). Exit non-zero so shell
+        // idioms like `ken show <id> || ...` work as expected. Any error
+        // returned from `run` — argument errors, usage errors, not-found,
+        // database errors, file errors, JSON parse errors, conflicts,
+        // unknown commands/flags, missing required options — lands here.
+        std.process.exit(1);
+    };
+}
+
+fn run(process: std.process.Init) !void {
     const arena = process.arena.allocator();
     const raw_args = try process.minimal.args.toSlice(arena);
 
@@ -82,9 +106,9 @@ pub fn main(process: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "-D") or std.mem.eql(u8, arg, "--db")) {
                 i += 1;
                 if (i >= raw_args.len) {
-                    try stderr.print("Error: -D/--db requires a path argument\n", .{});
-                    try stderr.flush();
-                    return;
+                    stderr.print("Error: -D/--db requires a path argument\n", .{}) catch {};
+                    stderr.flush() catch {};
+                    return error.Reported;
                 }
                 explicit_db_path = raw_args[i];
             } else {
@@ -95,9 +119,9 @@ pub fn main(process: std.process.Init) !void {
     const args = filtered.items;
 
     if (args.len < 2) {
-        try stderr.print(usage, .{});
-        try stderr.flush();
-        return;
+        stderr.print(usage, .{}) catch {};
+        stderr.flush() catch {};
+        return error.Reported;
     }
 
     if (ken.isHelpFlag(args[1])) {
@@ -107,9 +131,9 @@ pub fn main(process: std.process.Init) !void {
     }
 
     const cmd = std.meta.stringToEnum(Command, args[1]) orelse {
-        try stderr.print("Unknown command: {s}\n\n" ++ usage, .{args[1]});
-        try stderr.flush();
-        return;
+        stderr.print("Unknown command: {s}\n\n" ++ usage, .{args[1]}) catch {};
+        stderr.flush() catch {};
+        return error.Reported;
     };
 
     // Help flag check for commands without their own argument parsers.
@@ -117,7 +141,7 @@ pub fn main(process: std.process.Init) !void {
     // own parsers (add) handle -h internally so help is scoped to the
     // specific subcommand being asked about.
     switch (cmd) {
-        .pubkind, .relkind, .add, .relate, .list, .load, .merge => {},
+        .pubkind, .relkind, .add, .relate, .list, .show, .load, .merge => {},
         else => {
             if (hasHelpFlag(args[2..])) {
                 try printCommandUsage(cmd, stdout);
@@ -140,13 +164,13 @@ pub fn main(process: std.process.Init) !void {
             const db_path = ken.defaultDbPath(arena) catch {
                 try stderr.print("Error: could not determine default database path\n", .{});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             try stdout.print("{s}\n", .{db_path});
             try stdout.flush();
         },
         .init => {
-            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
+            const db_path = try resolveDbPath(explicit_db_path, arena, stderr);
             if (explicit_db_path == null) {
                 if (std.fs.path.dirname(db_path)) |dir_path| {
                     Io.Dir.createDirAbsolute(process.io, dir_path, .default_dir) catch |err| switch (err) {
@@ -154,7 +178,7 @@ pub fn main(process: std.process.Init) !void {
                         else => {
                             try stderr.print("Error: could not create directory '{s}'\n", .{dir_path});
                             try stderr.flush();
-                            return;
+                            return error.Reported;
                         },
                     };
                 }
@@ -162,13 +186,13 @@ pub fn main(process: std.process.Init) !void {
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             defer database.close();
             const prev = database.getVersion() catch {
                 try stderr.print("Error: could not read version from '{s}'\n", .{db_path});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             const v = database.migrate(ken.migrations) catch |err| {
                 if (err == error.DatabaseAheadOfMigrations) {
@@ -177,7 +201,7 @@ pub fn main(process: std.process.Init) !void {
                     try stderr.print("Error: migration failed\n", .{});
                 }
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             if (prev != null and prev.? == v) {
                 try stdout.print("Database at {s} already at version {d}, nothing to do\n", .{ db_path, v });
@@ -187,17 +211,17 @@ pub fn main(process: std.process.Init) !void {
             try stdout.flush();
         },
         .dbversion => {
-            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
+            const db_path = try resolveDbPath(explicit_db_path, arena, stderr);
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             defer database.close();
             const v = database.getVersion() catch {
                 try stderr.print("Error: could not read version from '{s}'\n", .{db_path});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             if (v) |ver| {
                 try stdout.print("{d}\n", .{ver});
@@ -219,14 +243,14 @@ pub fn main(process: std.process.Init) !void {
                     else => try stderr.print("Error: invalid arguments for 'add'\n", .{}),
                 }
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
 
-            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
+            const db_path = try resolveDbPath(explicit_db_path, arena, stderr);
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             defer database.close();
 
@@ -237,12 +261,12 @@ pub fn main(process: std.process.Init) !void {
             ) catch {
                 try stderr.print("Error: could not query database\n", .{});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             if (!kind_exists) {
                 try stderr.print("Error: unknown publication kind '{s}'\n", .{action.kind});
                 try stderr.flush();
-                return;
+                return error.Reported;
             }
 
             // Generate UUID and insert publication
@@ -254,7 +278,7 @@ pub fn main(process: std.process.Init) !void {
             ) catch {
                 try stderr.print("Error: could not insert publication\n", .{});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
 
             // For notes with a file key, read file and insert into notes table
@@ -280,7 +304,7 @@ pub fn main(process: std.process.Init) !void {
                         ) catch {
                             try stderr.print("Error: could not insert note body\n", .{});
                             try stderr.flush();
-                            return;
+                            return error.Reported;
                         };
                     }
                 }
@@ -302,14 +326,14 @@ pub fn main(process: std.process.Init) !void {
                     else => try stderr.print("Error: invalid arguments for 'relate'\n", .{}),
                 }
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
 
-            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
+            const db_path = try resolveDbPath(explicit_db_path, arena, stderr);
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             defer database.close();
 
@@ -320,12 +344,12 @@ pub fn main(process: std.process.Init) !void {
             ) catch {
                 try stderr.print("Error: could not query database\n", .{});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             if (!subject_exists) {
                 try stderr.print("Error: subject publication '{s}' not found\n", .{action.subject});
                 try stderr.flush();
-                return;
+                return error.Reported;
             }
 
             // Validate object exists
@@ -335,12 +359,12 @@ pub fn main(process: std.process.Init) !void {
             ) catch {
                 try stderr.print("Error: could not query database\n", .{});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             if (!object_exists) {
                 try stderr.print("Error: object publication '{s}' not found\n", .{action.object});
                 try stderr.flush();
-                return;
+                return error.Reported;
             }
 
             // Validate relationship kind exists
@@ -350,12 +374,12 @@ pub fn main(process: std.process.Init) !void {
             ) catch {
                 try stderr.print("Error: could not query database\n", .{});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             if (!kind_exists) {
                 try stderr.print("Error: unknown relationship kind '{s}'\n", .{action.kind});
                 try stderr.flush();
-                return;
+                return error.Reported;
             }
 
             // Generate UUID and insert relationship
@@ -367,7 +391,7 @@ pub fn main(process: std.process.Init) !void {
             ) catch {
                 try stderr.print("Error: could not insert relationship\n", .{});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
 
             try stdout.print("{s}\n", .{&uuid});
@@ -387,21 +411,59 @@ pub fn main(process: std.process.Init) !void {
                     else => try stderr.print("Error: invalid arguments for 'list'\n", .{}),
                 }
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
 
-            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
+            const db_path = try resolveDbPath(explicit_db_path, arena, stderr);
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             defer database.close();
 
             ken.executeListAction(&database, arena, action, stdout) catch {
                 try stderr.print("Error: could not list publications\n", .{});
                 try stderr.flush();
-                return;
+                return error.Reported;
+            };
+            try stdout.flush();
+        },
+        .show => {
+            const action = ken.parseShowArgs(args, 1) catch |err| {
+                if (err == error.HelpRequested) {
+                    try stdout.writeAll(ken.showUsage);
+                    try stdout.flush();
+                    return;
+                }
+                switch (err) {
+                    error.MissingArgument => try stderr.print("Error: missing argument. Usage: ken show <id> [--json] | ken show --key <key> [--json]\n", .{}),
+                    error.UnknownFlag => try stderr.print("Error: unknown or conflicting argument. Usage: ken show <id> [--json] | ken show --key <key> [--json]\n", .{}),
+                    else => try stderr.print("Error: invalid arguments for 'show'\n", .{}),
+                }
+                try stderr.flush();
+                return error.Reported;
+            };
+
+            const db_path = try resolveDbPath(explicit_db_path, arena, stderr);
+            var database = ken.db.Db.open(db_path) catch {
+                try stderr.print("Error: could not open database '{s}'\n", .{db_path});
+                try stderr.flush();
+                return error.Reported;
+            };
+            defer database.close();
+
+            ken.executeShowAction(&database, arena, action, stdout, stderr) catch |err| {
+                if (err != error.NotFound) {
+                    // executeShowAction writes a descriptive "Error: ..."
+                    // message to stderr itself for error.NotFound. For other
+                    // failures it does not, so add a generic diagnostic here.
+                    stderr.print("Error: could not show publication\n", .{}) catch {};
+                }
+                stderr.flush() catch {};
+                // Every failure (missing publication, SQL error, ...) is
+                // non-zero: `main` turns this returned error into exit 1.
+                return error.Reported;
             };
             try stdout.flush();
         },
@@ -418,7 +480,7 @@ pub fn main(process: std.process.Init) !void {
                     else => try stderr.print("Error: invalid arguments for 'load'\n", .{}),
                 }
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
 
             // Read file
@@ -427,43 +489,43 @@ pub fn main(process: std.process.Init) !void {
                 const file = Io.Dir.openFile(.cwd(), process.io, action.file_path, .{}) catch {
                     try stderr.print("Error: could not open file '{s}'\n", .{action.file_path});
                     try stderr.flush();
-                    return;
+                    return error.Reported;
                 };
                 defer file.close(process.io);
                 const stat = file.stat(process.io) catch {
                     try stderr.print("Error: could not stat file '{s}'\n", .{action.file_path});
                     try stderr.flush();
-                    return;
+                    return error.Reported;
                 };
                 const size: usize = @intCast(stat.size);
                 if (size == 0) {
                     try stderr.print("Error: file is empty\n", .{});
                     try stderr.flush();
-                    return;
+                    return error.Reported;
                 }
                 if (size > max_load_size) {
                     try stderr.print("Error: file exceeds 50 MB limit\n", .{});
                     try stderr.flush();
-                    return;
+                    return error.Reported;
                 }
                 const buf = arena.alloc(u8, size) catch {
                     try stderr.print("Error: out of memory\n", .{});
                     try stderr.flush();
-                    return;
+                    return error.Reported;
                 };
                 const n = file.readPositionalAll(process.io, buf, 0) catch {
                     try stderr.print("Error: could not read file '{s}'\n", .{action.file_path});
                     try stderr.flush();
-                    return;
+                    return error.Reported;
                 };
                 break :blk buf[0..n];
             };
 
-            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
+            const db_path = try resolveDbPath(explicit_db_path, arena, stderr);
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             defer database.close();
 
@@ -473,7 +535,7 @@ pub fn main(process: std.process.Init) !void {
 
             ken.executeLoadAction(&database, arena, file_content, prng.random(), stdout, stderr) catch {
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             try stdout.flush();
         },
@@ -490,14 +552,14 @@ pub fn main(process: std.process.Init) !void {
                     else => try stderr.print("Error: invalid arguments for 'merge'\n", .{}),
                 }
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
 
-            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
+            const db_path = try resolveDbPath(explicit_db_path, arena, stderr);
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             defer database.close();
 
@@ -506,7 +568,7 @@ pub fn main(process: std.process.Init) !void {
                     try stderr.print("Error: merge aborted due to kind conflicts (use --force to override)\n", .{});
                 }
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             try stdout.flush();
         },
@@ -520,24 +582,25 @@ pub fn main(process: std.process.Init) !void {
                 }
                 try ken.formatKindError(entity, err, stderr);
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
 
-            const db_path = resolveDbPath(explicit_db_path, arena, stderr) orelse return;
+            const db_path = try resolveDbPath(explicit_db_path, arena, stderr);
             var database = ken.db.Db.open(db_path) catch {
                 try stderr.print("Error: could not open database '{s}'\n", .{db_path});
                 try stderr.flush();
-                return;
+                return error.Reported;
             };
             defer database.close();
 
             ken.executeKindAction(&database, arena, entity, action, stdout, stderr) catch {
                 // executeKindAction has already written a descriptive
-                // "Error: ..." message to stderr. Exit non-zero so that
-                // shell idioms like `ken pubkind show X || ken pubkind add X`
-                // work as expected (a missing kind must be a failure).
+                // "Error: ..." message to stderr. Returning the error makes
+                // `main` exit non-zero so that shell idioms like
+                // `ken pubkind show X || ken pubkind add X` work as expected
+                // (a missing kind must be a failure).
                 stderr.flush() catch {};
-                std.process.exit(1);
+                return error.Reported;
             };
             try stdout.flush();
         },
@@ -548,11 +611,11 @@ pub fn main(process: std.process.Init) !void {
     }
 }
 
-fn resolveDbPath(explicit: ?[:0]const u8, alloc: std.mem.Allocator, stderr: anytype) ?[:0]const u8 {
+fn resolveDbPath(explicit: ?[:0]const u8, alloc: std.mem.Allocator, stderr: anytype) ![:0]const u8 {
     return explicit orelse (ken.defaultDbPath(alloc) catch {
         stderr.print("Error: could not determine default database path\n", .{}) catch {};
         stderr.flush() catch {};
-        return null;
+        return error.Reported;
     });
 }
 

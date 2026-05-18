@@ -1,11 +1,9 @@
 name: test
 
-on:
-  pull_request:
-    branches: [main]
+on: [push, pull_request]
 
 jobs:
-  test:
+  unit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,4 +12,60 @@ jobs:
         with:
           version: 0.16.0-dev.2676+4e2cec265
 
-      - run: zig build test --summary all
+      - name: Unit tests
+        run: zig build test --summary all
+
+      - name: Formatting
+        run: zig fmt --check .
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0-dev.2676+4e2cec265
+
+      - name: Build ken
+        run: zig build
+
+      - name: CLI exit-code assertions
+        run: |
+          set -u
+          KEN="$(pwd)/zig-out/bin/ken"
+          test -x "$KEN" || { echo "FAIL: built binary not found at $KEN"; exit 1; }
+
+          # assert_exit <expected-code> <description> <ken args...>
+          assert_exit() {
+            want="$1"; shift
+            desc="$1"; shift
+            set +e
+            "$KEN" "$@" >/dev/null 2>&1
+            got=$?
+            set -e
+            if [ "$got" != "$want" ]; then
+              echo "FAIL: $desc -> exit $got, expected $want"
+              exit 1
+            fi
+            echo "ok: $desc (exit $got)"
+          }
+
+          # Success paths exit 0.
+          assert_exit 0 "version succeeds"        version
+          assert_exit 0 "help succeeds"           help
+
+          # Failure modes all exit 1.
+          assert_exit 1 "no command"
+          assert_exit 1 "unknown command"         definitelynotacommand
+          assert_exit 1 "unknown flag"            add note --definitely-not-a-flag
+          assert_exit 1 "show with no args"       show
+          assert_exit 1 "-D without a value"      -D
+          assert_exit 1 "relate missing options"  relate -o x -r cites
+
+          # show on a not-found id (against a freshly initialized db) exits 1.
+          DB="$(mktemp -d)/ken-test.db"
+          assert_exit 0 "init a fresh db"         -D "$DB" init
+          assert_exit 1 "show not-found id"       -D "$DB" show 00000000-0000-0000-0000-000000000000
+
+          echo "All CLI exit-code assertions passed."
